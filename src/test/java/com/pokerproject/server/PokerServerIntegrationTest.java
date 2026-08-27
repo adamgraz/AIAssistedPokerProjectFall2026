@@ -86,6 +86,94 @@ class PokerServerIntegrationTest {
         assertEquals(15, aNext.path("payload").path("round").path("pot").asLong());
     }
 
+    // Exercises CALL/CHECK/BET (not just FOLD) and drives a hand through every street to a
+    // real showdown, over the wire. Can't assert on the COMPLETE/revealedHoleCards moment
+    // itself - see the note below - so this asserts on what a client actually observes:
+    // correct street progression, growing board, and total chips conserved end to end.
+    @Test
+    void twoClientsPlayAFullHandToShowdownOverTheWire() throws Exception {
+        Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
+        app = new PokerServer(table).start(0);
+        String url = "ws://localhost:" + app.port() + "/ws";
+
+        TestClient a = new TestClient(url);
+        TestClient b = new TestClient(url);
+        a.next(); // WELCOME
+        b.next(); // WELCOME
+
+        a.send("{\"type\":\"SIT_DOWN\",\"payload\":{\"displayName\":\"A\",\"amount\":1000}}");
+        a.next();
+        b.next();
+
+        b.send("{\"type\":\"SIT_DOWN\",\"payload\":{\"displayName\":\"B\",\"amount\":1000}}");
+        JsonNode aStarted = a.next();
+        b.next();
+        assertEquals("PREFLOP", aStarted.path("payload").path("round").path("stage").asText());
+        long startingTotal = totalStacks(aStarted);
+
+        // Preflop: A (seat 0, dealer/small blind) acts first heads-up, facing the big blind.
+        a.send("{\"type\":\"CALL\",\"payload\":{}}");
+        a.next();
+        b.next();
+        b.send("{\"type\":\"CHECK\",\"payload\":{}}");
+        JsonNode afterPreflop = a.next();
+        b.next();
+        assertEquals("FLOP", afterPreflop.path("payload").path("round").path("stage").asText());
+        assertEquals(3, afterPreflop.path("payload").path("round").path("board").size());
+
+        // Postflop: the non-dealer (B) acts first every street.
+        b.send("{\"type\":\"BET\",\"payload\":{\"amount\":20}}");
+        a.next();
+        b.next();
+        a.send("{\"type\":\"CALL\",\"payload\":{}}");
+        JsonNode afterFlop = a.next();
+        b.next();
+        assertEquals("TURN", afterFlop.path("payload").path("round").path("stage").asText());
+        assertEquals(4, afterFlop.path("payload").path("round").path("board").size());
+
+        b.send("{\"type\":\"CHECK\",\"payload\":{}}");
+        a.next();
+        b.next();
+        a.send("{\"type\":\"CHECK\",\"payload\":{}}");
+        JsonNode afterTurn = a.next();
+        b.next();
+        assertEquals("RIVER", afterTurn.path("payload").path("round").path("stage").asText());
+        assertEquals(5, afterTurn.path("payload").path("round").path("board").size());
+
+        b.send("{\"type\":\"CHECK\",\"payload\":{}}");
+        a.next();
+        b.next();
+        a.send("{\"type\":\"CHECK\",\"payload\":{}}");
+        JsonNode aFinal = a.next();
+        JsonNode bFinal = b.next();
+
+        // The hand resolves at showdown and, since neither player busted, immediately chains
+        // into a new hand inside the same apply() call - by the time this broadcast fires,
+        // the COMPLETE-stage snapshot (with revealedHoleCards) already happened and passed.
+        // No test can observe it over the wire as the server is built today; only the total
+        // chip count is guaranteed stable across that whole sequence.
+        assertEquals(startingTotal, totalStacks(aFinal));
+        assertEquals(startingTotal, totalStacks(bFinal));
+    }
+
+    // Stacks alone aren't stable across this call - if the hand chained into a new one,
+    // blinds are already posted for it, so whatever's in the new round's pot has to be added
+    // back to make an apples-to-apples total, same as TableEngineTest's chip-conservation check.
+    private static long totalStacks(JsonNode envelope) {
+        long total = 0;
+        for (JsonNode seat : envelope.path("payload").path("seats")) {
+            JsonNode player = seat.path("player");
+            if (!player.isNull() && !player.isMissingNode()) {
+                total += player.path("stack").asLong();
+            }
+        }
+        JsonNode round = envelope.path("payload").path("round");
+        if (!round.isNull() && !round.isMissingNode()) {
+            total += round.path("pot").asLong();
+        }
+        return total;
+    }
+
     private static final class TestClient implements WebSocket.Listener {
         private final WebSocket socket;
         private final LinkedBlockingQueue<String> messages = new LinkedBlockingQueue<>();
