@@ -1,16 +1,15 @@
 import { useEffect, useRef, useState } from "react";
-import type { Envelope, TableSnapshot } from "./protocol";
 
 const WS_URL = "ws://localhost:7070/ws";
 
 // One WebSocket connection for the whole app's lifetime. React's dev-mode double-mount
 // would otherwise open two sockets - the ref guards against that, not just cleanliness.
 export function useGameSocket() {
-  const socketRef = useRef<WebSocket | null>(null);
+  const socketRef = useRef(null);
   const [connected, setConnected] = useState(false);
-  const [playerId, setPlayerId] = useState<string | null>(null);
-  const [table, setTable] = useState<TableSnapshot | null>(null);
-  const [lastError, setLastError] = useState<string | null>(null);
+  const [playerId, setPlayerId] = useState(null);
+  const [table, setTable] = useState(null);
+  const [lastError, setLastError] = useState(null);
 
   useEffect(() => {
     const socket = new WebSocket(WS_URL);
@@ -20,16 +19,16 @@ export function useGameSocket() {
     socket.onclose = () => setConnected(false);
 
     socket.onmessage = (event) => {
-      const envelope: Envelope = JSON.parse(event.data);
+      const envelope = JSON.parse(event.data);
       switch (envelope.type) {
         case "WELCOME":
-          setPlayerId((envelope.payload as { playerId: string }).playerId);
+          setPlayerId(envelope.payload.playerId);
           break;
         case "STATE":
-          setTable(envelope.payload as TableSnapshot);
+          setTable(envelope.payload);
           break;
         case "ERROR":
-          setLastError((envelope.payload as { message: string }).message);
+          setLastError(envelope.payload.message);
           break;
       }
     };
@@ -37,7 +36,7 @@ export function useGameSocket() {
     return () => socket.close();
   }, []);
 
-  function send(type: string, payload: Record<string, unknown> = {}) {
+  function send(type, payload = {}) {
     socketRef.current?.send(JSON.stringify({ type, payload }));
   }
 
