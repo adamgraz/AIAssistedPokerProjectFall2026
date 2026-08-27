@@ -14,6 +14,7 @@ function App() {
   const mySeat = table?.seats.find((s) => s.player?.id === playerId) ?? null;
   const isSeated = mySeat !== null;
   const isMyTurn = round !== null && mySeat !== null && round.actingSeat === mySeat.index;
+  const canAct = connected && isMyTurn;
   const occupiedSeats = table?.seats.filter((s) => s.player !== null) ?? [];
 
   return (
@@ -56,7 +57,7 @@ function App() {
             value={buyIn}
             onChange={(e) => setBuyIn(Number(e.target.value))}
           />
-          <button onClick={() => send("SIT_DOWN", { displayName, amount: buyIn })}>
+          <button disabled={!connected} onClick={() => send("SIT_DOWN", { displayName, amount: buyIn })}>
             Sit down
           </button>
         </div>
@@ -65,16 +66,16 @@ function App() {
       {isSeated && round && (
         <div className="controls">
           <h2>Actions</h2>
-          <button disabled={!isMyTurn} onClick={() => send("FOLD")}>Fold</button>
-          <button disabled={!isMyTurn} onClick={() => send("CHECK")}>Check</button>
-          <button disabled={!isMyTurn} onClick={() => send("CALL")}>Call</button>
-          <button disabled={!isMyTurn} onClick={() => send("BET", { amount: betAmount })}>
+          <button disabled={!canAct} onClick={() => send("FOLD")}>Fold</button>
+          <button disabled={!canAct} onClick={() => send("CHECK")}>Check</button>
+          <button disabled={!canAct} onClick={() => send("CALL")}>Call</button>
+          <button disabled={!canAct} onClick={() => send("BET", { amount: betAmount })}>
             Bet
           </button>
-          <button disabled={!isMyTurn} onClick={() => send("RAISE", { amount: betAmount })}>
+          <button disabled={!canAct} onClick={() => send("RAISE", { amount: betAmount })}>
             Raise
           </button>
-          <button disabled={!isMyTurn} onClick={() => send("ALL_IN")}>All in</button>
+          <button disabled={!canAct} onClick={() => send("ALL_IN")}>All in</button>
           <input
             type="number"
             value={betAmount}

@@ -39,7 +39,11 @@ export function useGameSocket() {
   }, []);
 
   function send(type, payload = {}) {
-    socketRef.current?.send(JSON.stringify({ type, payload }));
+    if (socketRef.current?.readyState !== WebSocket.OPEN) {
+      console.warn("[ws] cannot send, socket isn't open:", type);
+      return;
+    }
+    socketRef.current.send(JSON.stringify({ type, payload }));
   }
 
   return { connected, playerId, table, lastError, send };
