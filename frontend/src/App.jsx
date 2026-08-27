@@ -1,49 +1,87 @@
 import { useState } from "react";
 import { useGameSocket } from "./useGameSocket";
+import { Card } from "./Card";
+import { Seat } from "./Seat";
 import "./App.css";
 
-// First-pass wiring, not a real table UI yet: proves the socket round-trip (connect, sit
-// down, send an action, see broadcast state) with a raw JSON dump instead of rendered seats.
 function App() {
   const { connected, playerId, table, lastError, send } = useGameSocket();
   const [displayName, setDisplayName] = useState("Player");
   const [buyIn, setBuyIn] = useState(1000);
-  const [actionAmount, setActionAmount] = useState(0);
+  const [betAmount, setBetAmount] = useState(20);
+
+  const round = table?.round ?? null;
+  const mySeat = table?.seats.find((s) => s.player?.id === playerId) ?? null;
+  const isSeated = mySeat !== null;
+  const isMyTurn = round !== null && mySeat !== null && round.actingSeat === mySeat.index;
+  const occupiedSeats = table?.seats.filter((s) => s.player !== null) ?? [];
 
   return (
-    <div style={{ fontFamily: "monospace", padding: "1.5rem", maxWidth: 700 }}>
-      <h1>Poker - wire test</h1>
-      <p>connected: {String(connected)}</p>
-      <p>your playerId: {playerId ?? "(waiting for WELCOME)"}</p>
-      {lastError && <p style={{ color: "crimson" }}>last error: {lastError}</p>}
+    <div className="page">
+      <h1>Poker</h1>
+      <p className="conn-status">
+        {connected ? "connected" : "disconnected"}
+        {playerId && ` — ${playerId.slice(0, 8)}`}
+      </p>
+      {lastError && <p className="error">{lastError}</p>}
 
-      <h2>Sit down</h2>
-      <input value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
-      <input
-        type="number"
-        value={buyIn}
-        onChange={(e) => setBuyIn(Number(e.target.value))}
-      />
-      <button onClick={() => send("SIT_DOWN", { displayName, amount: buyIn })}>
-        Sit down
-      </button>
+      <div className="felt">
+        <div className="board">
+          {round?.board.map((card, i) => <Card key={i} card={card} />)}
+          {!round && <span className="felt-hint">Waiting for a hand to start…</span>}
+        </div>
+        {round && <div className="pot">Pot: {round.pot}</div>}
+        {isMyTurn && <div className="turn-banner">Your turn</div>}
+      </div>
 
-      <h2>Send an action</h2>
-      {["FOLD", "CHECK", "CALL", "BET", "RAISE", "ALL_IN"].map((type) => (
-        <button key={type} onClick={() => send(type, { amount: actionAmount })}>
-          {type}
-        </button>
-      ))}
-      <br />
-      amount:{" "}
-      <input
-        type="number"
-        value={actionAmount}
-        onChange={(e) => setActionAmount(Number(e.target.value))}
-      />
+      <div className="seats">
+        {occupiedSeats.map((seat) => (
+          <Seat
+            key={seat.index}
+            seat={seat}
+            table={table}
+            round={round}
+            isYou={seat.player.id === playerId}
+            isActing={round?.actingSeat === seat.index}
+          />
+        ))}
+      </div>
 
-      <h2>Table state</h2>
-      <pre>{JSON.stringify(table, null, 2)}</pre>
+      {!isSeated && (
+        <div className="controls">
+          <h2>Sit down</h2>
+          <input value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
+          <input
+            type="number"
+            value={buyIn}
+            onChange={(e) => setBuyIn(Number(e.target.value))}
+          />
+          <button onClick={() => send("SIT_DOWN", { displayName, amount: buyIn })}>
+            Sit down
+          </button>
+        </div>
+      )}
+
+      {isSeated && round && (
+        <div className="controls">
+          <h2>Actions</h2>
+          <button disabled={!isMyTurn} onClick={() => send("FOLD")}>Fold</button>
+          <button disabled={!isMyTurn} onClick={() => send("CHECK")}>Check</button>
+          <button disabled={!isMyTurn} onClick={() => send("CALL")}>Call</button>
+          <button disabled={!isMyTurn} onClick={() => send("BET", { amount: betAmount })}>
+            Bet
+          </button>
+          <button disabled={!isMyTurn} onClick={() => send("RAISE", { amount: betAmount })}>
+            Raise
+          </button>
+          <button disabled={!isMyTurn} onClick={() => send("ALL_IN")}>All in</button>
+          <input
+            type="number"
+            value={betAmount}
+            onChange={(e) => setBetAmount(Number(e.target.value))}
+          />
+        </div>
+      )}
     </div>
   );
 }

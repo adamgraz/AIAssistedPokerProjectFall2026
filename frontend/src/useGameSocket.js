@@ -20,6 +20,8 @@ export function useGameSocket() {
 
     socket.onmessage = (event) => {
       const envelope = JSON.parse(event.data);
+      // Not shown in the UI - inspect the wire payload via DevTools console instead.
+      console.log("[ws]", envelope.type, envelope.payload);
       switch (envelope.type) {
         case "WELCOME":
           setPlayerId(envelope.payload.playerId);
