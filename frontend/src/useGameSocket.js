@@ -15,10 +15,18 @@ export function useGameSocket() {
     const socket = new WebSocket(WS_URL);
     socketRef.current = socket;
 
-    socket.onopen = () => setConnected(true);
-    socket.onclose = () => setConnected(false);
+    // StrictMode's dev-only double-mount opens a throwaway socket, then this same effect
+    // runs again for real. The throwaway's close event fires asynchronously and can arrive
+    // *after* the real socket has already connected - without this check, that stale event
+    // clobbers `connected` back to false and it never recovers. Every handler below only
+    // acts if `socket` is still the one currently in socketRef.
+    const isCurrent = () => socketRef.current === socket;
+
+    socket.onopen = () => { if (isCurrent()) setConnected(true); };
+    socket.onclose = () => { if (isCurrent()) setConnected(false); };
 
     socket.onmessage = (event) => {
+      if (!isCurrent()) return;
       const envelope = JSON.parse(event.data);
       // Not shown in the UI - inspect the wire payload via DevTools console instead.
       console.log("[ws]", envelope.type, envelope.payload);
