@@ -10,6 +10,15 @@ application {
 group = 'com.pokerproject'
 version = '1.0-SNAPSHOT'
 
+// Pins the JDK version compilation targets regardless of which JDK Gradle itself happens to
+// run on (IntelliJ's "Gradle JVM" setting) - without this, compileJava silently targets
+// whatever JDK is running Gradle, which can drift from the JDK actually used to run the app.
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
 repositories {
     mavenCentral()
 }
