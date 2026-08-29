@@ -8,6 +8,7 @@ import com.pokerproject.protocol.TableCommandRequest;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -21,11 +22,19 @@ class TableEngineTest {
     }
 
     private static TableCommandRequest sitDown(UUID id, String name, long amount) {
-        return new TableCommandRequest(id, TableCommand.SIT_DOWN, name, amount);
+        return new TableCommandRequest(id, TableCommand.SIT_DOWN, name, amount, null, null);
     }
 
     private static PlayerAction action(UUID id, ActionType type, long amount) {
         return new PlayerAction(id, type, amount);
+    }
+
+    private static TableCommandRequest nextHand(UUID id) {
+        return new TableCommandRequest(id, TableCommand.NEXT_HAND, null, 0, null, null);
+    }
+
+    private static TableCommandRequest voteMode(UUID id, GameVariant mode) {
+        return new TableCommandRequest(id, TableCommand.VOTE_GAME_MODE, null, 0, mode.name(), null);
     }
 
     @Test
@@ -82,6 +91,22 @@ class TableEngineTest {
     }
 
     @Test
+    void uncontestedFoldRecordsTheRemainingPlayerAsWinner() {
+        Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
+        UUID a = UUID.randomUUID();
+        UUID b = UUID.randomUUID();
+        table.apply(sitDown(a, "A", 1000));
+        table.apply(sitDown(b, "B", 1000));
+
+        GameRound round = table.currentRound();
+        UUID firstActor = table.seats()[round.actingSeat()].player().id();
+        UUID other = firstActor.equals(a) ? b : a;
+        table.apply(action(firstActor, ActionType.FOLD, 0));
+
+        assertEquals(Set.of(other), round.winners());
+    }
+
+    @Test
     void threeWayAllInProducesCorrectSidePotSplit() {
         Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
         UUID a = UUID.randomUUID();
@@ -100,14 +125,13 @@ class TableEngineTest {
         UUID firstActor = table.seats()[firstHand.actingSeat()].player().id();
         table.apply(action(firstActor, ActionType.FOLD, 0));
 
-        // That fold resolved the hand and auto-started the next one - now 3-handed (A, B, C).
+        // That fold resolved the hand (COMPLETE, no auto-chain) - explicitly open voting and
+        // decide the mode to deal the next hand, now 3-handed (A, B, C).
+        table.apply(nextHand(a));
+        table.apply(voteMode(a, GameVariant.TEXAS_HOLDEM));
         GameRound round = table.currentRound();
         assertEquals(RoundStage.PREFLOP, round.stage());
         assertEquals(3, round.holeCards().size());
-
-        // Close the table once this hand ends, so finishHand() doesn't chain into a hand 3
-        // (A and B will both still have chips) and post new blinds before the assertions run.
-        table.apply(new TableCommandRequest(a, TableCommand.END_TABLE, null, 0));
 
         // Stack the deck: A gets pocket aces, B and C get hands that can't beat them on
         // this board, so the showdown outcome is deterministic.
@@ -150,6 +174,13 @@ class TableEngineTest {
         // board - A must win every tier it's eligible for.
         assertEquals(totalChipsInPlay - findPlayer(table, b).stack() - findPlayer(table, c).stack(),
                 findPlayer(table, a).stack());
+
+        // A has the winning hand, so A must be recorded as a winner of at least one tier.
+        // Not asserting exclusivity: if A or B happens to have carried a bigger stack into
+        // this hand than the other (a side effect of who won hand 1), the extra tier above
+        // C's short stack but below the bigger stack's total has only one eligible player -
+        // an uncalled-bet return that legitimately also counts them as that tier's "winner".
+        assertTrue(round.winners().contains(a));
     }
 
     private static int findSeat(Table table, UUID playerId) {

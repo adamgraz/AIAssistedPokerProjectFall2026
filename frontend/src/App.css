@@ -16,6 +16,45 @@
   font-weight: 500;
 }
 
+.turn-banner-top {
+  display: inline-block;
+  background: #f4c542;
+  color: #3a2c00;
+  font-weight: 700;
+  padding: 4px 14px;
+  border-radius: 999px;
+  font-size: 14px;
+  margin-top: 16px;
+}
+
+.round-banner-top {
+  display: inline-block;
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: var(--mono);
+  padding: 4px 14px;
+  border-radius: 999px;
+  font-size: 13px;
+  margin-top: 16px;
+  margin-right: 8px;
+}
+
+.leave-button {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 12px;
+  background: var(--code-bg);
+  color: var(--text-h);
+  font-size: 13px;
+  cursor: pointer;
+  margin-top: 8px;
+}
+
+.leave-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 /* --- table felt (center) --- */
 
 .felt {
@@ -49,17 +88,6 @@
   color: #f4e9c8;
   font-weight: 600;
   font-family: var(--mono);
-}
-
-.turn-banner {
-  position: absolute;
-  top: -14px;
-  background: #f4c542;
-  color: #3a2c00;
-  font-weight: 700;
-  padding: 4px 14px;
-  border-radius: 999px;
-  font-size: 14px;
 }
 
 /* --- playing cards --- */
@@ -127,6 +155,10 @@
   color: var(--text-h);
 }
 
+.winner-crown {
+  margin-right: 4px;
+}
+
 .seat-tags {
   display: flex;
   gap: 4px;
@@ -150,6 +182,11 @@
   color: var(--accent);
 }
 
+.tag-disconnected {
+  background: #f8d7da;
+  color: #8a2c2c;
+}
+
 .seat-stack {
   font-family: var(--mono);
   font-size: 14px;
@@ -158,6 +195,17 @@
 .seat-status {
   font-size: 12px;
   color: var(--text);
+}
+
+.kick-button {
+  margin-top: 8px;
+  border: 1px solid #d1453b;
+  border-radius: 6px;
+  padding: 4px 10px;
+  background: transparent;
+  color: #d1453b;
+  font-size: 12px;
+  cursor: pointer;
 }
 
 .hole-cards {
@@ -170,6 +218,91 @@
   width: 32px;
   height: 46px;
   font-size: 13px;
+}
+
+.best-five {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.best-five-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text);
+}
+
+/* --- game mode voting --- */
+
+.mode-vote {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 24px;
+}
+
+.mode-vote h2 {
+  text-align: left;
+}
+
+.mode-columns {
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+.mode-column {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 140px;
+}
+
+.voter-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 13px;
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.not-voted {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--text);
+}
+
+.not-voted ul {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.mode-option {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 14px;
+  background: var(--code-bg);
+  color: var(--text-h);
+  font-family: var(--mono);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.mode-option.voted {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+  color: var(--accent);
 }
 
 /* --- controls --- */
@@ -192,4 +325,58 @@
 .controls button:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+/* --- final stats modal --- */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 28px;
+  width: 280px;
+  box-shadow: var(--shadow);
+}
+
+.modal-card h2 {
+  text-align: left;
+  margin-bottom: 16px;
+}
+
+.modal-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+}
+
+.modal-net.positive {
+  color: #1e8e3e;
+}
+
+.modal-net.negative {
+  color: #d1453b;
+}
+
+.modal-continue {
+  width: 100%;
+  margin-top: 20px;
+  padding: 10px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+  cursor: pointer;
 }

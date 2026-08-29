@@ -6,6 +6,7 @@ import com.pokerproject.protocol.TableCommandRequest;
 
 import java.security.SecureRandom;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -19,7 +20,7 @@ public final class Table {
     private final Seat[] seats;
     private final List<Player> roster = new ArrayList<>();
     private int dealerSeat = -1; // -1 means no hand has been played yet
-    private final GameVariant variant;
+    private GameVariant variant;
     private final GameConfig config;
     private GameRound currentRound;
     private boolean closed;
@@ -27,6 +28,13 @@ public final class Table {
     private final SecureRandom random = new SecureRandom();
     private final Set<UUID> pendingLeaves = new HashSet<>();
     private boolean pendingClose;
+    private Runnable onHandComplete;
+
+    // Votes for which GameVariant the NEXT hand should use. Only accepted while votingOpen -
+    // a player opens the window with NEXT_HAND once the previous hand has finished; the moment
+    // a winner is decided, the hand deals immediately and this resets for the window after that.
+    private final Map<UUID, GameVariant> modeVotes = new HashMap<>();
+    private boolean votingOpen;
 
     public Table(int seatCount, GameVariant variant, GameConfig config) {
         this.seats = new Seat[seatCount];
@@ -53,6 +61,30 @@ public final class Table {
         return variant;
     }
 
+    // Live vote counts for the next hand's mode, keyed by mode.
+    public Map<GameVariant, Long> voteTally() {
+        Map<GameVariant, Long> tally = new HashMap<>();
+        for (GameVariant v : modeVotes.values()) {
+            tally.merge(v, 1L, Long::sum);
+        }
+        return tally;
+    }
+
+    public GameVariant voteOf(UUID playerId) {
+        return modeVotes.get(playerId);
+    }
+
+    // Raw playerId -> vote for the in-progress voting window. Not secret info - the wire
+    // layer uses this to group voters by mode and list who hasn't voted, same for every viewer.
+    public Map<UUID, GameVariant> votes() {
+        return Map.copyOf(modeVotes);
+    }
+
+    // True between a NEXT_HAND request and the moment a mode is decided and the hand deals.
+    public boolean votingOpen() {
+        return votingOpen;
+    }
+
     public GameConfig config() {
         return config;
     }
@@ -63,6 +95,14 @@ public final class Table {
 
     public boolean isClosed() {
         return closed;
+    }
+
+    // Fires right after a hand reaches COMPLETE (revealed hole cards, final pot) but before
+    // finishHand() chains into the next hand or nulls the round - the only point where that
+    // stage is observable at all. Wire layer uses this to broadcast the showdown snapshot
+    // that would otherwise never go out, since finishHand() runs synchronously inside apply().
+    public void setOnHandComplete(Runnable listener) {
+        this.onHandComplete = listener;
     }
 
     public long occupiedSeatCount() {
@@ -95,6 +135,9 @@ public final class Table {
             case LEAVE_TABLE -> handleLeaveTable(request);
             case REBUY -> handleRebuy(request);
             case END_TABLE -> handleEndTable(request);
+            case VOTE_GAME_MODE -> handleVoteGameMode(request);
+            case NEXT_HAND -> handleNextHand(request);
+            case REMOVE_PLAYER -> handleRemovePlayer(request);
         }
     }
 
@@ -116,8 +159,10 @@ public final class Table {
         seats[emptySeat].setPlayer(player);
         roster.add(player);
 
+        // Only the very first hand ever auto-starts - every hand after that waits for a
+        // player to call NEXT_HAND (see handleNextHand/checkVoteOutcome).
         if (currentRound == null && occupiedSeatCount() >= 2 && !closed) {
-            startHand();
+            startHand(variant);
         }
     }
 
@@ -150,6 +195,121 @@ public final class Table {
         }
     }
 
+    private void handleNextHand(TableCommandRequest request) {
+        findPlayer(request.playerId()); // must be seated; throws otherwise
+        if (!isBetweenHands()) {
+            throw new IllegalStateException("hand still in progress");
+        }
+        if (occupiedSeatCount() < 2) {
+            throw new IllegalStateException("need at least 2 players for another hand");
+        }
+        votingOpen = true; // idempotent - a second click while already open is a harmless no-op
+    }
+
+    // Removes an orphaned seat - PokerServer has already verified the target has no live
+    // connection before this is ever dispatched (Table has no notion of connections, so it
+    // can't check that itself). Unlike LEAVE_TABLE this is never deferred: a seat whose
+    // connection is gone forever can't be waited on to finish a hand it can never act in.
+    private void handleRemovePlayer(TableCommandRequest request) {
+        findPlayer(request.playerId()); // the requester must themselves be seated
+        UUID target;
+        try {
+            target = UUID.fromString(request.targetPlayerId());
+        } catch (IllegalArgumentException | NullPointerException e) {
+            throw new IllegalStateException("invalid target player id");
+        }
+        Player targetPlayer = findPlayer(target); // throws if already gone
+
+        // !isBetweenHands() rules out COMPLETE too, not just a live round - forceFold ends in
+        // awardUncontestedPot for a heads-up removal, and re-running that against an already-
+        // COMPLETE round (still holding ACTIVE status right up until finishHand's cleanup)
+        // would double-pay whoever's left. Only a genuinely live betting street forces a fold.
+        if (!isBetweenHands() && currentRound.holeCards().containsKey(target)
+                && (targetPlayer.status() == PlayerStatus.ACTIVE || targetPlayer.status() == PlayerStatus.ALL_IN)) {
+            forceFold(currentRound, targetPlayer);
+        }
+        removeFromSeat(target);
+        pendingLeaves.remove(target);
+    }
+
+    // Same bookkeeping as a real FOLD, but only advances actingSeat if the removed player was
+    // actually the one on the clock - otherwise whoever's legitimately still up stays up.
+    private void forceFold(GameRound round, Player player) {
+        boolean wasActing = round.actingSeat() >= 0
+                && seats[round.actingSeat()].player() != null
+                && seats[round.actingSeat()].player().id().equals(player.id());
+
+        player.setStatus(PlayerStatus.FOLDED);
+        round.toAct().remove(player.id());
+
+        if (seatsInHand(round).size() <= 1) {
+            awardUncontestedPot(round);
+            return;
+        }
+        if (!wasActing) {
+            return;
+        }
+        if (!round.toAct().isEmpty()) {
+            round.setActingSeat(nextSeatInToAct(round, round.actingSeat()));
+            return;
+        }
+        advanceToNextStreetOrShowdown(round);
+    }
+
+    private void handleVoteGameMode(TableCommandRequest request) {
+        findPlayer(request.playerId()); // must be seated to vote; throws otherwise
+        if (!votingOpen) {
+            throw new IllegalStateException("voting isn't open - call NEXT_HAND first");
+        }
+        GameVariant vote;
+        try {
+            vote = GameVariant.valueOf(request.gameVariant());
+        } catch (IllegalArgumentException | NullPointerException e) {
+            throw new IllegalStateException("unknown game mode: " + request.gameVariant());
+        }
+        modeVotes.put(request.playerId(), vote);
+        checkVoteOutcome();
+    }
+
+    // Decides the next hand's mode and deals it in immediately, the moment either becomes
+    // true: (a) a mode has mathematically clinched - no other mode could catch up even if
+    // every player who hasn't voted yet piled onto whichever single rival is best-positioned
+    // to benefit - or (b) every seated player has voted and it's still tied, so there's no
+    // reason to keep waiting; the tie is broken at random.
+    // ponytail: doesn't re-check when a non-voting player leaves mid-vote (would shrink
+    // "remaining" and might newly decide it) - only re-checked on the next actual vote. Add
+    // if a stalled vote near the end of a hand turns out to matter in practice.
+    private void checkVoteOutcome() {
+        Map<GameVariant, Long> tally = voteTally();
+        long maxCount = tally.values().stream().mapToLong(Long::longValue).max().orElse(0);
+        if (maxCount == 0) {
+            return;
+        }
+        List<GameVariant> leaders = tally.entrySet().stream()
+                .filter(e -> e.getValue() == maxCount)
+                .map(Map.Entry::getKey)
+                .toList();
+        long remaining = Math.max(0, occupiedSeatCount() - modeVotes.size());
+
+        GameVariant decided = null;
+        if (leaders.size() == 1) {
+            GameVariant leader = leaders.get(0);
+            List<GameVariant> rivals = Arrays.stream(GameVariant.values())
+                    .filter(v -> v != leader)
+                    .toList();
+            long bestRivalCurrent = rivals.stream().mapToLong(v -> tally.getOrDefault(v, 0L)).max().orElse(0);
+            if (rivals.isEmpty() || maxCount > bestRivalCurrent + remaining) {
+                decided = leader;
+            }
+        }
+        if (decided == null && remaining == 0) {
+            decided = leaders.get(random.nextInt(leaders.size())); // deadlocked, everyone's voted
+        }
+        if (decided != null) {
+            startHand(decided);
+        }
+    }
+
     private boolean isBetweenHands() {
         return currentRound == null
                 || currentRound.stage() == RoundStage.WAITING
@@ -178,7 +338,11 @@ public final class Table {
 
     // === Hand lifecycle ===
 
-    private void startHand() {
+    private void startHand(GameVariant nextVariant) {
+        variant = nextVariant;
+        modeVotes.clear();
+        votingOpen = false;
+
         for (Seat seat : seats) {
             Player player = seat.player();
             if (player != null && player.status() != PlayerStatus.SITTING_OUT) {
@@ -453,8 +617,8 @@ public final class Table {
     private void awardUncontestedPot(GameRound round) {
         UUID winner = seats[firstSeatInHand(round)].player().id();
         findPlayer(winner).addToStack(round.pot().total());
-        round.setStage(RoundStage.COMPLETE);
-        finishHand();
+        round.winners().add(winner);
+        completeHand(round);
     }
 
     private void resolveShowdown(GameRound round) {
@@ -470,9 +634,17 @@ public final class Table {
         for (Pot.SidePot sidePot : round.pot().resolve(folded)) {
             List<UUID> winners = bestHandWinners(round, sidePot.eligiblePlayers());
             splitPotAmongWinners(sidePot.amount(), winners);
+            round.winners().addAll(winners);
         }
 
+        completeHand(round);
+    }
+
+    private void completeHand(GameRound round) {
         round.setStage(RoundStage.COMPLETE);
+        if (onHandComplete != null) {
+            onHandComplete.run();
+        }
         finishHand();
     }
 
@@ -484,6 +656,7 @@ public final class Table {
             sevenCards.addAll(round.board());
             EvaluatedHand hand = HandEvaluator.evaluate(sevenCards);
             evaluated.put(id, hand);
+            round.bestFiveByPlayer().put(id, hand.cards());
             if (best == null || hand.compareTo(best) > 0) {
                 best = hand;
             }
@@ -541,11 +714,9 @@ public final class Table {
             return;
         }
 
-        if (occupiedSeatCount() >= 2 && !closed) {
-            startHand();
-        } else {
-            currentRound = null;
-        }
+        // currentRound is deliberately left in place (still at COMPLETE) - the showdown
+        // result stays visible until a player calls NEXT_HAND and a vote decides the next
+        // hand's mode; see handleNextHand/checkVoteOutcome.
     }
 
     // === Seat helpers ===

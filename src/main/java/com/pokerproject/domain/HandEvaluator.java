@@ -9,11 +9,16 @@ public final class HandEvaluator {
     }
 
     public static EvaluatedHand evaluate(List<Card> sevenCards) {
-        long best = 0;
+        long best = Long.MIN_VALUE;
+        List<Card> bestFive = null;
         for (List<Card> five : fiveCardCombinations(sevenCards)) {
-            best = Math.max(best, classify(five));
+            long score = classify(five);
+            if (score > best) {
+                best = score;
+                bestFive = five;
+            }
         }
-        return new EvaluatedHand(best);
+        return new EvaluatedHand(best, bestFive);
     }
 
     private static List<List<Card>> fiveCardCombinations(List<Card> cards) {

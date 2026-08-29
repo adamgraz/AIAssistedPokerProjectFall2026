@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 // Translates a Table's live domain state into what one specific viewer is allowed to see.
@@ -22,17 +23,21 @@ public final class SnapshotBuilder {
     private SnapshotBuilder() {
     }
 
-    public static TableSnapshot build(Table table, UUID viewerId) {
+    // connectedPlayerIds: playerIds with a currently-open WebSocket, straight from
+    // PokerServer's connection registry - Table itself has no notion of connections.
+    public static TableSnapshot build(Table table, UUID viewerId, Set<UUID> connectedPlayerIds) {
         List<SeatSnapshot> seats = new ArrayList<>();
         for (Seat seat : table.seats()) {
             Player p = seat.player();
             PlayerSnapshot playerSnapshot = (p == null) ? null
-                    : new PlayerSnapshot(p.id(), p.displayName(), p.stack(), p.status());
+                    : new PlayerSnapshot(p.id(), p.displayName(), p.stack(), p.totalBuyIn(), p.status(),
+                            connectedPlayerIds.contains(p.id()));
             seats.add(new SeatSnapshot(seat.index(), playerSnapshot));
         }
 
         RoundSnapshot round = buildRound(table, table.currentRound(), viewerId);
-        return new TableSnapshot(seats, table.dealerSeat(), table.isClosed(), round);
+        return new TableSnapshot(seats, table.dealerSeat(), table.isClosed(), round,
+                table.variant(), table.votingOpen(), table.votes());
     }
 
     private static RoundSnapshot buildRound(Table table, GameRound round, UUID viewerId) {
@@ -56,6 +61,7 @@ public final class SnapshotBuilder {
 
         return new RoundSnapshot(round.stage(), round.board(), round.pot().total(),
                 round.smallBlindSeat(), round.bigBlindSeat(), round.actingSeat(), round.currentBet(),
-                yourHoleCards, revealed);
+                yourHoleCards, revealed, round.contributionThisStreet(viewerId), round.bestFiveByPlayer(),
+                round.winners());
     }
 }

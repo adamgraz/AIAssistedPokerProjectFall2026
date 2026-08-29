@@ -10,6 +10,7 @@ export function useGameSocket() {
   const [playerId, setPlayerId] = useState(null);
   const [table, setTable] = useState(null);
   const [lastError, setLastError] = useState(null);
+  const [availableModes, setAvailableModes] = useState([]);
 
   useEffect(() => {
     const socket = new WebSocket(WS_URL);
@@ -33,9 +34,12 @@ export function useGameSocket() {
       switch (envelope.type) {
         case "WELCOME":
           setPlayerId(envelope.payload.playerId);
+          setAvailableModes(envelope.payload.availableModes ?? []);
           break;
         case "STATE":
           setTable(envelope.payload);
+          // STATE only ever broadcasts after a successful apply() - clear any stale error.
+          setLastError(null);
           break;
         case "ERROR":
           setLastError(envelope.payload.message);
@@ -54,5 +58,5 @@ export function useGameSocket() {
     socketRef.current.send(JSON.stringify({ type, payload }));
   }
 
-  return { connected, playerId, table, lastError, send };
+  return { connected, playerId, table, lastError, send, availableModes };
 }

@@ -2,6 +2,7 @@ package com.pokerproject.server;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.pokerproject.domain.GameConfig;
 import com.pokerproject.domain.Table;
@@ -19,7 +20,9 @@ import io.javalin.websocket.WsConnectContext;
 import io.javalin.websocket.WsContext;
 import io.javalin.websocket.WsMessageContext;
 
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -37,6 +40,7 @@ public final class PokerServer {
 
     public PokerServer(Table table) {
         this.table = table;
+        table.setOnHandComplete(this::broadcastState);
     }
 
     public Javalin start() {
@@ -57,6 +61,10 @@ public final class PokerServer {
         connections.put(ctx, playerId);
         ObjectNode payload = MAPPER.createObjectNode();
         payload.put("playerId", playerId.toString());
+        ArrayNode modes = payload.putArray("availableModes");
+        for (GameVariant variant : GameVariant.values()) {
+            modes.add(variant.name());
+        }
         ctx.send(new Envelope("WELCOME", payload));
     }
 
@@ -94,12 +102,33 @@ public final class PokerServer {
         if (isTableCommand(type)) {
             String displayName = payload.path("displayName").asText(null);
             long amount = payload.path("amount").asLong(0);
-            table.apply(new TableCommandRequest(playerId, TableCommand.valueOf(type), displayName, amount));
+            String gameVariant = payload.path("mode").asText(null);
+            String targetPlayerId = payload.path("targetPlayerId").asText(null);
+            TableCommand command = TableCommand.valueOf(type);
+            if (command == TableCommand.REMOVE_PLAYER) {
+                verifyTargetIsOrphaned(targetPlayerId);
+            }
+            table.apply(new TableCommandRequest(playerId, command, displayName, amount, gameVariant, targetPlayerId));
         } else if (isActionType(type)) {
             long amount = payload.path("amount").asLong(0);
             table.apply(new PlayerAction(playerId, ActionType.valueOf(type), amount));
         } else {
             throw new IllegalStateException("unknown message type: " + type);
+        }
+    }
+
+    // The one piece of business logic at this layer: only PokerServer knows which playerIds
+    // have a live connection right now (connections' values), Table has no notion of a
+    // connection at all - so this has to be checked here, before the command ever reaches it.
+    private void verifyTargetIsOrphaned(String targetPlayerId) {
+        UUID target;
+        try {
+            target = UUID.fromString(targetPlayerId);
+        } catch (IllegalArgumentException | NullPointerException e) {
+            throw new IllegalStateException("invalid target player id");
+        }
+        if (connections.containsValue(target)) {
+            throw new IllegalStateException("that player is still connected - can't remove them");
         }
     }
 
@@ -122,8 +151,9 @@ public final class PokerServer {
     }
 
     private void broadcastState() {
+        Set<UUID> connectedIds = new HashSet<>(connections.values());
         for (Map.Entry<WsContext, UUID> entry : connections.entrySet()) {
-            TableSnapshot snapshot = SnapshotBuilder.build(table, entry.getValue());
+            TableSnapshot snapshot = SnapshotBuilder.build(table, entry.getValue(), connectedIds);
             entry.getKey().send(new Envelope("STATE", MAPPER.valueToTree(snapshot)));
         }
     }

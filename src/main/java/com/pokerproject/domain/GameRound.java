@@ -33,6 +33,14 @@ public final class GameRound {
     // cumulative across the whole hand, so this is what call/raise math actually needs.
     private final Map<UUID, Long> streetContributions = new HashMap<>();
 
+    // Populated only at a real showdown (never for an uncontested fold win, where hands are
+    // never compared) - each eligible player's best 5 of their 7 cards, for UI highlighting.
+    private final Map<UUID, List<Card>> bestFiveByPlayer = new HashMap<>();
+
+    // Everyone who won any share of the pot - a Set because a player can win more than one
+    // side pot, and more than one player can tie for a single pot. Empty until COMPLETE.
+    private final Set<UUID> winners = new HashSet<>();
+
     public Deck deck() {
         return deck;
     }
@@ -111,5 +119,13 @@ public final class GameRound {
 
     public long contributionThisStreet(UUID playerId) {
         return streetContributions.getOrDefault(playerId, 0L);
+    }
+
+    public Map<UUID, List<Card>> bestFiveByPlayer() {
+        return bestFiveByPlayer;
+    }
+
+    public Set<UUID> winners() {
+        return winners;
     }
 }
