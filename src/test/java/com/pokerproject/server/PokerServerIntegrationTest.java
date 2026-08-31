@@ -64,6 +64,20 @@ class PokerServerIntegrationTest {
         assertTrue(bSeesAOnlySeated.path("payload").path("round").isNull());
 
         b.send("{\"type\":\"SIT_DOWN\",\"payload\":{\"displayName\":\"B\",\"amount\":1000}}");
+        JsonNode aBothSeated = a.next();
+        JsonNode bBothSeated = b.next();
+        assertTrue(aBothSeated.path("payload").path("round").isNull()); // still nothing dealt
+        assertTrue(bBothSeated.path("payload").path("round").isNull());
+
+        // Nothing ever auto-starts, not even the first hand of the night - everyone gets a
+        // chance to join before it deals.
+        a.send("{\"type\":\"NEXT_HAND\",\"payload\":{}}");
+        a.next();
+        b.next();
+        a.send("{\"type\":\"VOTE_GAME_MODE\",\"payload\":{\"mode\":\"TEXAS_HOLDEM\"}}");
+        a.next();
+        b.next();
+        b.send("{\"type\":\"VOTE_GAME_MODE\",\"payload\":{\"mode\":\"TEXAS_HOLDEM\"}}");
         JsonNode aStarted = a.next();
         JsonNode bStarted = b.next();
         assertEquals("PREFLOP", aStarted.path("payload").path("round").path("stage").asText());
@@ -86,6 +100,10 @@ class PokerServerIntegrationTest {
         JsonNode bComplete = b.next();
         assertEquals("COMPLETE", aComplete.path("payload").path("round").path("stage").asText());
         assertEquals("COMPLETE", bComplete.path("payload").path("round").path("stage").asText());
+        // Nobody's cards get shown for an uncontested fold win, not even the winner's -
+        // hands were never compared, same as a real table.
+        assertTrue(aComplete.path("payload").path("round").path("revealedHoleCards").isEmpty());
+        assertTrue(bComplete.path("payload").path("round").path("revealedHoleCards").isEmpty());
         a.next();
         b.next();
 
@@ -94,11 +112,14 @@ class PokerServerIntegrationTest {
         a.next();
         b.next();
         a.send("{\"type\":\"VOTE_GAME_MODE\",\"payload\":{\"mode\":\"TEXAS_HOLDEM\"}}");
+        a.next();
+        b.next();
+        b.send("{\"type\":\"VOTE_GAME_MODE\",\"payload\":{\"mode\":\"TEXAS_HOLDEM\"}}");
         JsonNode aNext = a.next();
         JsonNode bNext = b.next();
 
-        // With only one GameVariant value, that single vote decides and deals immediately -
-        // both clients should see a fresh PREFLOP round with blinds already posted.
+        // Both clients voted the same way, so that decides and deals immediately - both
+        // should see a fresh PREFLOP round with blinds already posted.
         assertEquals("PREFLOP", aNext.path("payload").path("round").path("stage").asText());
         assertEquals("PREFLOP", bNext.path("payload").path("round").path("stage").asText());
         assertEquals(15, aNext.path("payload").path("round").path("pot").asLong());
@@ -124,6 +145,17 @@ class PokerServerIntegrationTest {
         b.next();
 
         b.send("{\"type\":\"SIT_DOWN\",\"payload\":{\"displayName\":\"B\",\"amount\":1000}}");
+        a.next();
+        b.next();
+
+        // Nothing ever auto-starts, not even the first hand of the night.
+        a.send("{\"type\":\"NEXT_HAND\",\"payload\":{}}");
+        a.next();
+        b.next();
+        a.send("{\"type\":\"VOTE_GAME_MODE\",\"payload\":{\"mode\":\"TEXAS_HOLDEM\"}}");
+        a.next();
+        b.next();
+        b.send("{\"type\":\"VOTE_GAME_MODE\",\"payload\":{\"mode\":\"TEXAS_HOLDEM\"}}");
         JsonNode aStarted = a.next();
         b.next();
         assertEquals("PREFLOP", aStarted.path("payload").path("round").path("stage").asText());
@@ -137,7 +169,7 @@ class PokerServerIntegrationTest {
         JsonNode afterPreflop = a.next();
         b.next();
         assertEquals("FLOP", afterPreflop.path("payload").path("round").path("stage").asText());
-        assertEquals(3, afterPreflop.path("payload").path("round").path("board").size());
+        assertEquals(3, afterPreflop.path("payload").path("round").path("boards").get(0).size());
 
         // Postflop: the non-dealer (B) acts first every street.
         b.send("{\"type\":\"BET\",\"payload\":{\"amount\":20}}");
@@ -147,7 +179,7 @@ class PokerServerIntegrationTest {
         JsonNode afterFlop = a.next();
         b.next();
         assertEquals("TURN", afterFlop.path("payload").path("round").path("stage").asText());
-        assertEquals(4, afterFlop.path("payload").path("round").path("board").size());
+        assertEquals(4, afterFlop.path("payload").path("round").path("boards").get(0).size());
 
         b.send("{\"type\":\"CHECK\",\"payload\":{}}");
         a.next();
@@ -156,7 +188,7 @@ class PokerServerIntegrationTest {
         JsonNode afterTurn = a.next();
         b.next();
         assertEquals("RIVER", afterTurn.path("payload").path("round").path("stage").asText());
-        assertEquals(5, afterTurn.path("payload").path("round").path("board").size());
+        assertEquals(5, afterTurn.path("payload").path("round").path("boards").get(0).size());
 
         b.send("{\"type\":\"CHECK\",\"payload\":{}}");
         a.next();
@@ -171,8 +203,9 @@ class PokerServerIntegrationTest {
         assertEquals("COMPLETE", aComplete.path("payload").path("round").path("stage").asText());
         assertEquals(2, aComplete.path("payload").path("round").path("revealedHoleCards").size());
         assertEquals(2, bComplete.path("payload").path("round").path("revealedHoleCards").size());
-        assertEquals(2, aComplete.path("payload").path("round").path("bestFive").size());
-        for (JsonNode five : aComplete.path("payload").path("round").path("bestFive")) {
+        JsonNode board0BestFive = aComplete.path("payload").path("round").path("bestFiveByBoard").get(0);
+        assertEquals(2, board0BestFive.size());
+        for (JsonNode five : board0BestFive) {
             assertEquals(5, five.size());
         }
         a.next(); // PokerServer's own post-apply broadcast, same COMPLETE state again
@@ -184,6 +217,9 @@ class PokerServerIntegrationTest {
         a.next();
         b.next();
         a.send("{\"type\":\"VOTE_GAME_MODE\",\"payload\":{\"mode\":\"TEXAS_HOLDEM\"}}");
+        a.next();
+        b.next();
+        b.send("{\"type\":\"VOTE_GAME_MODE\",\"payload\":{\"mode\":\"TEXAS_HOLDEM\"}}");
         JsonNode aFinal = a.next();
         JsonNode bFinal = b.next();
         assertEquals(startingTotal, totalStacks(aFinal));
@@ -209,6 +245,17 @@ class PokerServerIntegrationTest {
         a.next();
         b.next();
         b.send("{\"type\":\"SIT_DOWN\",\"payload\":{\"displayName\":\"B\",\"amount\":1000}}");
+        a.next();
+        b.next();
+
+        // Nothing ever auto-starts, not even the first hand of the night.
+        a.send("{\"type\":\"NEXT_HAND\",\"payload\":{}}");
+        a.next();
+        b.next();
+        a.send("{\"type\":\"VOTE_GAME_MODE\",\"payload\":{\"mode\":\"TEXAS_HOLDEM\"}}");
+        a.next();
+        b.next();
+        b.send("{\"type\":\"VOTE_GAME_MODE\",\"payload\":{\"mode\":\"TEXAS_HOLDEM\"}}");
         a.next(); // PREFLOP
         b.next();
 

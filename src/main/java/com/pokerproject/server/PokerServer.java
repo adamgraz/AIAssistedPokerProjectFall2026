@@ -25,22 +25,60 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
-// Phase 2: pure plumbing. Every incoming message maps 1:1 onto a Table.apply(...) call
-// already proven correct in Phase 1 - no betting/hand-lifecycle logic lives here. The only
+// Pure plumbing. Every incoming message maps 1:1 onto a Table.apply(...) call already
+// proven correct in Table's own tests - no betting/hand-lifecycle logic lives here. The only
 // real logic added at this layer is per-viewer hole-card redaction (SnapshotBuilder), which
-// is a wire-serialization concern, not a game rule.
+// is a wire-serialization concern, not a game rule. The one exception is the bomb pot opt-in
+// timeout below - Table has no notion of real time or a clock, so "60 seconds" has to live
+// at the layer that does.
 public final class PokerServer {
 
     private static final int DEFAULT_PORT = 7070;
+    // Not sent over the wire - App.jsx's countdown is cosmetic only and keeps its own copy
+    // (BOMB_POT_OPT_IN_SECONDS) in sync by hand. This value is what actually closes the window.
+    private static final long BOMB_POT_OPT_IN_TIMEOUT_SECONDS = 60;
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final Table table;
     private final Map<WsContext, UUID> connections = new ConcurrentHashMap<>();
+    // Daemon thread: PokerServer has no explicit shutdown() today (tests just create a new
+    // instance per test), so a non-daemon scheduler thread would leak and keep the JVM alive.
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "bomb-pot-opt-in-timer");
+        t.setDaemon(true);
+        return t;
+    });
+    private volatile ScheduledFuture<?> bombPotOptInTimer;
 
     public PokerServer(Table table) {
         this.table = table;
         table.setOnHandComplete(this::broadcastState);
+        table.setOnBombPotOptInWindowOpened(this::scheduleBombPotOptInTimeout);
+        table.setOnBombPotOptInWindowResolved(this::cancelBombPotOptInTimer);
+    }
+
+    // Scheduled once per opt-in window, the moment it opens. If the window resolves early
+    // (everyone responds before the timeout), onBombPotOptInWindowResolved cancels this -
+    // Table.expireBombPotOptInWindow() is also a safe no-op on a stale/already-closed window,
+    // so a race between the two is harmless either way.
+    private void scheduleBombPotOptInTimeout() {
+        bombPotOptInTimer = scheduler.schedule(() -> {
+            synchronized (table) {
+                table.expireBombPotOptInWindow();
+            }
+            broadcastState();
+        }, BOMB_POT_OPT_IN_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    }
+
+    private void cancelBombPotOptInTimer() {
+        if (bombPotOptInTimer != null) {
+            bombPotOptInTimer.cancel(false);
+        }
     }
 
     public Javalin start() {
@@ -69,8 +107,11 @@ public final class PokerServer {
     }
 
     private void onClose(WsCloseContext ctx) {
-        // Deferred to Phase 4: a closed socket does NOT remove the player from the table -
-        // reconnect handling isn't built yet, so leaving them seated is the safer default.
+        // A closed socket does NOT remove the player from the table - reclaiming your own
+        // seat on reconnect isn't built yet (see the Notes vault's "Next up" list), so leaving
+        // them seated is the safer default. The auto-reconnecting client (useGameSocket.js)
+        // re-opens a fresh connection, but arrives as a new, unseated visitor, not the same
+        // seat - REMOVE_PLAYER is the only way to free an orphaned seat today.
         connections.remove(ctx);
     }
 
@@ -81,6 +122,14 @@ public final class PokerServer {
             envelope = MAPPER.readValue(ctx.message(), Envelope.class);
         } catch (Exception e) {
             sendError(ctx, "malformed message");
+            return;
+        }
+
+        if ("PING".equals(envelope.type())) {
+            // Heartbeat only, no reply needed - Jetty has its own idle-timeout on a quiet
+            // WebSocket, and any traffic (even inbound) resets that clock. Without this, a
+            // long stretch of no real messages (thinking, between hands) eventually gets the
+            // connection dropped server-side even though nothing's actually wrong.
             return;
         }
 
@@ -165,7 +214,9 @@ public final class PokerServer {
     }
 
     public static void main(String[] args) {
-        Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
+        // 9 seats, 5/10 blinds, 10-chip bomb pot ante - change a value, restart the instance
+        // (see GameConfig's own doc comment; no live reload, no CLI/env config by design).
+        Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 10));
         new PokerServer(table).start();
     }
 }

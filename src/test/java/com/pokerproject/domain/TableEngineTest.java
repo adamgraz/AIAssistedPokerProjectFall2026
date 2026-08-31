@@ -37,14 +37,23 @@ class TableEngineTest {
         return new TableCommandRequest(id, TableCommand.VOTE_GAME_MODE, null, 0, mode.name(), null);
     }
 
+    // No hand ever auto-starts, not even the first - seats both players, then explicitly
+    // starts hand 1 the same way every later hand starts (NEXT_HAND -> both vote the same way).
+    private static void seatTwoAndStartHand(Table table, UUID a, UUID b) {
+        table.apply(sitDown(a, "A", 1000));
+        table.apply(sitDown(b, "B", 1000));
+        table.apply(nextHand(a));
+        table.apply(voteMode(a, GameVariant.TEXAS_HOLDEM));
+        table.apply(voteMode(b, GameVariant.TEXAS_HOLDEM));
+    }
+
     @Test
     void headsUpBlindsAndFirstToActFollowTheButtonRule() {
         Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
         UUID a = UUID.randomUUID();
         UUID b = UUID.randomUUID();
 
-        table.apply(sitDown(a, "A", 1000));
-        table.apply(sitDown(b, "B", 1000)); // triggers hand start, heads-up
+        seatTwoAndStartHand(table, a, b);
 
         GameRound round = table.currentRound();
         assertEquals(RoundStage.PREFLOP, round.stage());
@@ -56,12 +65,39 @@ class TableEngineTest {
     }
 
     @Test
+    void lastActionByPlayerTracksEachPlayersMostRecentActionAndResetsEachStreet() {
+        Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
+        UUID a = UUID.randomUUID();
+        UUID b = UUID.randomUUID();
+        seatTwoAndStartHand(table, a, b);
+
+        GameRound round = table.currentRound();
+        assertTrue(round.lastActionByPlayer().isEmpty()); // nobody's acted yet this street
+
+        UUID sb = table.seats()[round.actingSeat()].player().id();
+        UUID bb = sb.equals(a) ? b : a;
+
+        table.apply(action(sb, ActionType.RAISE, 30));
+        assertEquals(ActionType.RAISE, round.lastActionByPlayer().get(sb));
+        assertEquals(20, round.lastRaiseSize()); // raised to 30, up from BB's 10 - a 20 increment
+
+        table.apply(action(bb, ActionType.RAISE, 90)); // still preflop - both have now acted
+        assertEquals(ActionType.RAISE, round.lastActionByPlayer().get(sb));
+        assertEquals(ActionType.RAISE, round.lastActionByPlayer().get(bb));
+        assertEquals(60, round.lastRaiseSize()); // 90 - 30
+
+        table.apply(action(sb, ActionType.CALL, 0)); // closes preflop, deals the flop
+
+        assertEquals(RoundStage.FLOP, round.stage());
+        assertTrue(round.lastActionByPlayer().isEmpty()); // new street, nobody's acted yet
+    }
+
+    @Test
     void actingOutOfTurnIsRejected() {
         Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
         UUID a = UUID.randomUUID();
         UUID b = UUID.randomUUID();
-        table.apply(sitDown(a, "A", 1000));
-        table.apply(sitDown(b, "B", 1000));
+        seatTwoAndStartHand(table, a, b);
 
         GameRound round = table.currentRound();
         UUID notActingPlayer = table.seats()[round.actingSeat()].player().id().equals(a) ? b : a;
@@ -75,8 +111,7 @@ class TableEngineTest {
         Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
         UUID a = UUID.randomUUID();
         UUID b = UUID.randomUUID();
-        table.apply(sitDown(a, "A", 1000));
-        table.apply(sitDown(b, "B", 1000));
+        seatTwoAndStartHand(table, a, b);
 
         GameRound round = table.currentRound();
         UUID actor = table.seats()[round.actingSeat()].player().id();
@@ -95,15 +130,14 @@ class TableEngineTest {
         Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
         UUID a = UUID.randomUUID();
         UUID b = UUID.randomUUID();
-        table.apply(sitDown(a, "A", 1000));
-        table.apply(sitDown(b, "B", 1000));
+        seatTwoAndStartHand(table, a, b);
 
         GameRound round = table.currentRound();
         UUID firstActor = table.seats()[round.actingSeat()].player().id();
         UUID other = firstActor.equals(a) ? b : a;
         table.apply(action(firstActor, ActionType.FOLD, 0));
 
-        assertEquals(Set.of(other), round.winners());
+        assertEquals(Set.of(other), round.winnersByBoard().get(0));
     }
 
     @Test
@@ -113,22 +147,16 @@ class TableEngineTest {
         UUID b = UUID.randomUUID();
         UUID c = UUID.randomUUID();
 
-        // Seat A and B first - this auto-starts a heads-up hand before C can join.
+        // Nothing deals until NEXT_HAND is called, so all three can join before hand 1 -
+        // no need for a throwaway heads-up hand to get C into the game anymore.
         table.apply(sitDown(a, "A", 1000));
         table.apply(sitDown(b, "B", 1000));
-        // Seat C mid-hand: takes an empty seat but isn't dealt into the hand already
-        // in progress (round.holeCards() was already fixed before C existed).
         table.apply(sitDown(c, "C", 40));
-
-        // Dispose of the heads-up hand fast and uncontested: whoever's first to act folds.
-        GameRound firstHand = table.currentRound();
-        UUID firstActor = table.seats()[firstHand.actingSeat()].player().id();
-        table.apply(action(firstActor, ActionType.FOLD, 0));
-
-        // That fold resolved the hand (COMPLETE, no auto-chain) - explicitly open voting and
-        // decide the mode to deal the next hand, now 3-handed (A, B, C).
         table.apply(nextHand(a));
         table.apply(voteMode(a, GameVariant.TEXAS_HOLDEM));
+        // 2 of 3 agree with only 1 unvoted left - c couldn't flip the outcome, so this
+        // clinches and deals without waiting on c's vote.
+        table.apply(voteMode(b, GameVariant.TEXAS_HOLDEM));
         GameRound round = table.currentRound();
         assertEquals(RoundStage.PREFLOP, round.stage());
         assertEquals(3, round.holeCards().size());
@@ -176,11 +204,11 @@ class TableEngineTest {
                 findPlayer(table, a).stack());
 
         // A has the winning hand, so A must be recorded as a winner of at least one tier.
-        // Not asserting exclusivity: if A or B happens to have carried a bigger stack into
-        // this hand than the other (a side effect of who won hand 1), the extra tier above
-        // C's short stack but below the bigger stack's total has only one eligible player -
-        // an uncalled-bet return that legitimately also counts them as that tier's "winner".
-        assertTrue(round.winners().contains(a));
+        // Not asserting exclusivity: A and B posted different blinds (5 vs 10), so whichever
+        // one has more in already, the extra tier above C's short stack but below the bigger
+        // stack's total has only one eligible player - an uncalled-bet return that
+        // legitimately also counts them as that tier's "winner".
+        assertTrue(round.winnersByBoard().get(0).contains(a));
     }
 
     private static int findSeat(Table table, UUID playerId) {

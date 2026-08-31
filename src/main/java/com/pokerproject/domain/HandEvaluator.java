@@ -38,7 +38,7 @@ public final class HandEvaluator {
         return result;
     }
 
-    private static long classify(List<Card> five) {
+    static long classify(List<Card> five) {
         int[] countByRank = new int[13];
         for (Card card : five) {
             countByRank[card.rank().ordinal()]++;

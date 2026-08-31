@@ -14,12 +14,10 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-// GameVariant has only one value today, so the multi-candidate side of checkVoteOutcome's math
-// (a leader beating the best-positioned rival, ties broken at random when everyone's voted)
-// isn't reachable through the public API yet - these tests cover everything that IS reachable:
-// the "no rival could ever exist" instant-decide path, voting only being open in the gap
-// between hands, and the new hand dealing the instant a mode is decided. Re-verify the N>1
-// math by hand once a second variant with real rules exists.
+// GameVariant now has two values (TEXAS_HOLDEM, OMAHA), so a single vote no longer clinches
+// on its own - these tests have every seated player vote the same way to reach a decided,
+// dealt hand. The leader-vs-rival math itself (clinching early once a rival can't catch up,
+// ties broken at random once everyone's voted) isn't separately covered here yet.
 class GameModeVoteTest {
 
     private static TableCommandRequest sitDown(UUID id, String name, long amount) {
@@ -38,11 +36,15 @@ class GameModeVoteTest {
         return new PlayerAction(id, type, amount);
     }
 
-    // Seats A and B (auto-starts hand 1) and folds it uncontested, landing on COMPLETE without
-    // ever touching voting - the state every test in this file actually cares about starts from.
+    // Seats A and B, explicitly starts hand 1 (no hand ever auto-starts, not even the first),
+    // and folds it uncontested, landing on COMPLETE without ever touching voting again - the
+    // state every test in this file actually cares about starts from.
     private static void seatTwoAndFinishHandOne(Table table, UUID a, UUID b) {
         table.apply(sitDown(a, "A", 1000));
         table.apply(sitDown(b, "B", 1000));
+        table.apply(nextHand(a));
+        table.apply(vote(a, GameVariant.TEXAS_HOLDEM));
+        table.apply(vote(b, GameVariant.TEXAS_HOLDEM));
         GameRound round = table.currentRound();
         UUID firstActor = table.seats()[round.actingSeat()].player().id();
         table.apply(action(firstActor, ActionType.FOLD, 0));
@@ -61,7 +63,10 @@ class GameModeVoteTest {
         UUID a = UUID.randomUUID();
         UUID b = UUID.randomUUID();
         table.apply(sitDown(a, "A", 1000));
-        table.apply(sitDown(b, "B", 1000)); // hand 1 auto-starts, live
+        table.apply(sitDown(b, "B", 1000));
+        table.apply(nextHand(a));
+        table.apply(vote(a, GameVariant.TEXAS_HOLDEM));
+        table.apply(vote(b, GameVariant.TEXAS_HOLDEM)); // hand 1 starts, live
 
         assertThrows(IllegalStateException.class, () -> table.apply(nextHand(a)));
     }
@@ -81,7 +86,10 @@ class GameModeVoteTest {
         UUID a = UUID.randomUUID();
         UUID b = UUID.randomUUID();
         table.apply(sitDown(a, "A", 1000));
-        table.apply(sitDown(b, "B", 1000)); // hand 1 auto-starts, live - voting not open yet
+        table.apply(sitDown(b, "B", 1000));
+        table.apply(nextHand(a));
+        table.apply(vote(a, GameVariant.TEXAS_HOLDEM));
+        table.apply(vote(b, GameVariant.TEXAS_HOLDEM)); // hand 1 starts, live - voting not open again yet
 
         assertThrows(IllegalStateException.class, () -> table.apply(vote(a, GameVariant.TEXAS_HOLDEM)));
     }
@@ -110,9 +118,10 @@ class GameModeVoteTest {
         seatTwoAndFinishHandOne(table, a, b);
         table.apply(nextHand(a));
 
-        // With only one GameVariant value in existence there's no rival that could ever catch
-        // up - checkVoteOutcome's "rivals.isEmpty()" branch decides and deals on the first vote.
+        // Once every seated player has voted the same way, no rival could ever catch up -
+        // checkVoteOutcome decides and deals in the same call as the last vote.
         table.apply(vote(a, GameVariant.TEXAS_HOLDEM));
+        table.apply(vote(b, GameVariant.TEXAS_HOLDEM));
 
         assertFalse(table.votingOpen());
         assertTrue(table.voteTally().isEmpty()); // reset for the window after this hand
@@ -127,9 +136,10 @@ class GameModeVoteTest {
         UUID b = UUID.randomUUID();
         seatTwoAndFinishHandOne(table, a, b);
         table.apply(nextHand(a));
-        table.apply(vote(a, GameVariant.TEXAS_HOLDEM)); // decides and deals hand 2
+        table.apply(vote(a, GameVariant.TEXAS_HOLDEM));
+        table.apply(vote(b, GameVariant.TEXAS_HOLDEM)); // both voted the same way - decides and deals hand 2
 
-        assertThrows(IllegalStateException.class, () -> table.apply(vote(b, GameVariant.TEXAS_HOLDEM)));
+        assertThrows(IllegalStateException.class, () -> table.apply(vote(a, GameVariant.TEXAS_HOLDEM)));
     }
 
     @Test
@@ -141,6 +151,6 @@ class GameModeVoteTest {
         table.apply(nextHand(a));
 
         assertThrows(IllegalStateException.class,
-                () -> table.apply(new TableCommandRequest(a, TableCommand.VOTE_GAME_MODE, null, 0, "OMAHA", null)));
+                () -> table.apply(new TableCommandRequest(a, TableCommand.VOTE_GAME_MODE, null, 0, "SEVEN_CARD_STUD", null)));
     }
 }

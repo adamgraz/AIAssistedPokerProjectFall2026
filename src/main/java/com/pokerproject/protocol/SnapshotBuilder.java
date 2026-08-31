@@ -3,7 +3,6 @@ package com.pokerproject.protocol;
 import com.pokerproject.domain.Card;
 import com.pokerproject.domain.GameRound;
 import com.pokerproject.domain.Player;
-import com.pokerproject.domain.PlayerStatus;
 import com.pokerproject.domain.RoundStage;
 import com.pokerproject.domain.Seat;
 import com.pokerproject.domain.Table;
@@ -37,7 +36,8 @@ public final class SnapshotBuilder {
 
         RoundSnapshot round = buildRound(table, table.currentRound(), viewerId);
         return new TableSnapshot(seats, table.dealerSeat(), table.isClosed(), round,
-                table.variant(), table.votingOpen(), table.votes());
+                table.variant(), table.votingOpen(), table.votes(),
+                table.bombPotOptInOpen(), table.pendingBombPotVariant(), table.bombPotOptIns());
     }
 
     private static RoundSnapshot buildRound(Table table, GameRound round, UUID viewerId) {
@@ -53,15 +53,28 @@ public final class SnapshotBuilder {
         if (round.stage() == RoundStage.COMPLETE) {
             for (Seat seat : table.seats()) {
                 Player p = seat.player();
-                if (p != null && p.status() != PlayerStatus.FOLDED && round.holeCards().containsKey(p.id())) {
+                if (p != null && round.holeCards().containsKey(p.id()) && reachedShowdown(round, p.id())) {
                     revealed.put(p.id(), round.holeCards().get(p.id()).cards());
                 }
             }
         }
 
-        return new RoundSnapshot(round.stage(), round.board(), round.pot().total(),
+        return new RoundSnapshot(round.stage(), round.boards(), round.pot().total(),
                 round.smallBlindSeat(), round.bigBlindSeat(), round.actingSeat(), round.currentBet(),
-                yourHoleCards, revealed, round.contributionThisStreet(viewerId), round.bestFiveByPlayer(),
-                round.winners());
+                yourHoleCards, revealed, round.contributionThisStreet(viewerId), round.lastRaiseSize(),
+                round.lastActionByPlayer(), round.bestFiveByBoard(), round.winnersByBoard());
+    }
+
+    // A player's hand was actually compared - not just "didn't fold" - only when it shows up
+    // in bestFiveByBoard for some board. Never true for an uncontested fold win (that map
+    // stays empty; see Table.awardUncontestedPot vs resolveShowdown), so nobody's cards get
+    // revealed just because everyone else folded, same as a real table.
+    private static boolean reachedShowdown(GameRound round, UUID playerId) {
+        for (Map<UUID, List<Card>> board : round.bestFiveByBoard()) {
+            if (board.containsKey(playerId)) {
+                return true;
+            }
+        }
+        return false;
     }
 }

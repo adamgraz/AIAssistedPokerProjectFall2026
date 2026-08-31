@@ -73,7 +73,10 @@ class RemovePlayerTest {
         UUID a = UUID.randomUUID();
         UUID b = UUID.randomUUID();
         table.apply(sitDown(a, "A", 1000));
-        table.apply(sitDown(b, "B", 1000)); // hand 1 starts, heads-up
+        table.apply(sitDown(b, "B", 1000));
+        table.apply(nextHand(a));
+        table.apply(voteMode(a, GameVariant.TEXAS_HOLDEM));
+        table.apply(voteMode(b, GameVariant.TEXAS_HOLDEM)); // hand 1 starts, heads-up
 
         GameRound round = table.currentRound();
         UUID firstActor = table.seats()[round.actingSeat()].player().id();
@@ -91,7 +94,10 @@ class RemovePlayerTest {
         UUID a = UUID.randomUUID();
         UUID b = UUID.randomUUID();
         table.apply(sitDown(a, "A", 1000));
-        table.apply(sitDown(b, "B", 1000)); // heads-up hand starts
+        table.apply(sitDown(b, "B", 1000));
+        table.apply(nextHand(a));
+        table.apply(voteMode(a, GameVariant.TEXAS_HOLDEM));
+        table.apply(voteMode(b, GameVariant.TEXAS_HOLDEM)); // heads-up hand starts
 
         GameRound round = table.currentRound();
         UUID actingPlayer = table.seats()[round.actingSeat()].player().id();
@@ -111,16 +117,16 @@ class RemovePlayerTest {
         UUID a = UUID.randomUUID();
         UUID b = UUID.randomUUID();
         UUID c = UUID.randomUUID();
+        // Nothing deals until NEXT_HAND is called, so all three can join before hand 1 -
+        // no need for a throwaway heads-up hand to get C into the game anymore.
         table.apply(sitDown(a, "A", 1000));
-        table.apply(sitDown(b, "B", 1000)); // hand 1 starts, heads-up
-
-        GameRound hand1 = table.currentRound();
-        UUID firstActor = table.seats()[hand1.actingSeat()].player().id();
-        table.apply(action(firstActor, ActionType.FOLD, 0)); // COMPLETE
-
-        table.apply(sitDown(c, "C", 1000)); // now 3 occupied, between hands
+        table.apply(sitDown(b, "B", 1000));
+        table.apply(sitDown(c, "C", 1000));
         table.apply(nextHand(a));
-        table.apply(voteMode(a, GameVariant.TEXAS_HOLDEM)); // deals hand 2, 3-handed
+        table.apply(voteMode(a, GameVariant.TEXAS_HOLDEM));
+        // 2 of 3 agree with only 1 unvoted left - c couldn't flip the outcome, so this
+        // clinches and deals hand 1 (3-handed) without waiting on c's vote.
+        table.apply(voteMode(b, GameVariant.TEXAS_HOLDEM));
 
         GameRound hand2 = table.currentRound();
         assertEquals(3, hand2.holeCards().size());

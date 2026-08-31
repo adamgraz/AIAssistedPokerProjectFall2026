@@ -36,6 +36,15 @@ public final class Table {
     private final Map<UUID, GameVariant> modeVotes = new HashMap<>();
     private boolean votingOpen;
 
+    // Bomb pot opt-in: opened instead of dealing, the moment a bomb pot variant is decided.
+    // Only accepted while bombPotOptInOpen. Closes (and deals, if enough opted in) once every
+    // eligible player has responded or the wire layer's 60s timeout defaults the stragglers.
+    private final Map<UUID, Boolean> bombPotOptIns = new HashMap<>();
+    private boolean bombPotOptInOpen;
+    private GameVariant pendingBombPotVariant;
+    private Runnable onBombPotOptInWindowOpened;
+    private Runnable onBombPotOptInWindowResolved;
+
     public Table(int seatCount, GameVariant variant, GameConfig config) {
         this.seats = new Seat[seatCount];
         for (int i = 0; i < seatCount; i++) {
@@ -105,6 +114,32 @@ public final class Table {
         this.onHandComplete = listener;
     }
 
+    // Fires the moment a bomb pot variant is decided and the opt-in window opens - the wire
+    // layer's cue to schedule its 60s auto-opt-out timeout for this window.
+    public void setOnBombPotOptInWindowOpened(Runnable listener) {
+        this.onBombPotOptInWindowOpened = listener;
+    }
+
+    // Fires once the opt-in window closes for any reason (everyone responded, or the
+    // timeout defaulted the rest) - the wire layer's cue to cancel a still-pending timer,
+    // since the window it was scheduled for no longer exists.
+    public void setOnBombPotOptInWindowResolved(Runnable listener) {
+        this.onBombPotOptInWindowResolved = listener;
+    }
+
+    public boolean bombPotOptInOpen() {
+        return bombPotOptInOpen;
+    }
+
+    public GameVariant pendingBombPotVariant() {
+        return pendingBombPotVariant;
+    }
+
+    // Raw playerId -> opted-in for the in-progress window. Not secret info, same as votes().
+    public Map<UUID, Boolean> bombPotOptIns() {
+        return Map.copyOf(bombPotOptIns);
+    }
+
     public long occupiedSeatCount() {
         long count = 0;
         for (Seat seat : seats) {
@@ -138,6 +173,7 @@ public final class Table {
             case VOTE_GAME_MODE -> handleVoteGameMode(request);
             case NEXT_HAND -> handleNextHand(request);
             case REMOVE_PLAYER -> handleRemovePlayer(request);
+            case BOMB_POT_OPT -> handleBombPotOpt(request);
         }
     }
 
@@ -158,12 +194,9 @@ public final class Table {
         Player player = new Player(request.playerId(), request.displayName(), request.amount());
         seats[emptySeat].setPlayer(player);
         roster.add(player);
-
-        // Only the very first hand ever auto-starts - every hand after that waits for a
-        // player to call NEXT_HAND (see handleNextHand/checkVoteOutcome).
-        if (currentRound == null && occupiedSeatCount() >= 2 && !closed) {
-            startHand(variant);
-        }
+        // No hand ever auto-starts, including the first - always waits for a player to call
+        // NEXT_HAND (see handleNextHand/checkVoteOutcome), so everyone gets a chance to join
+        // before the night's first hand deals.
     }
 
     private void handleLeaveTable(TableCommandRequest request) {
@@ -199,6 +232,9 @@ public final class Table {
         findPlayer(request.playerId()); // must be seated; throws otherwise
         if (!isBetweenHands()) {
             throw new IllegalStateException("hand still in progress");
+        }
+        if (bombPotOptInOpen) {
+            throw new IllegalStateException("bomb pot opt-in is still open");
         }
         if (occupiedSeatCount() < 2) {
             throw new IllegalStateException("need at least 2 players for another hand");
@@ -256,6 +292,65 @@ public final class Table {
         advanceToNextStreetOrShowdown(round);
     }
 
+    private void handleBombPotOpt(TableCommandRequest request) {
+        Player player = findPlayer(request.playerId()); // must be seated; throws otherwise
+        if (!bombPotOptInOpen) {
+            throw new IllegalStateException("bomb pot opt-in isn't open");
+        }
+        bombPotOptIns.put(player.id(), request.amount() != 0);
+        maybeCloseBombPotOptInWindow();
+    }
+
+    private void maybeCloseBombPotOptInWindow() {
+        List<Integer> eligible = seatsEligibleToBeDealt();
+        long responded = eligible.stream()
+                .filter(idx -> bombPotOptIns.containsKey(seats[idx].player().id()))
+                .count();
+        if (responded < eligible.size()) {
+            return; // still waiting on someone
+        }
+        closeBombPotOptInWindow();
+    }
+
+    // Called by the wire layer 60s after the window opened - anyone who hasn't responded yet
+    // is defaulted to opted-out. No-op if the window already resolved naturally (everyone
+    // responded early) before the timer fired.
+    public void expireBombPotOptInWindow() {
+        if (!bombPotOptInOpen) {
+            return;
+        }
+        for (int idx : seatsEligibleToBeDealt()) {
+            UUID id = seats[idx].player().id();
+            bombPotOptIns.putIfAbsent(id, false);
+        }
+        closeBombPotOptInWindow();
+    }
+
+    private void closeBombPotOptInWindow() {
+        bombPotOptInOpen = false;
+        List<UUID> optedIn = new ArrayList<>();
+        for (int idx : seatsEligibleToBeDealt()) {
+            UUID id = seats[idx].player().id();
+            if (bombPotOptIns.getOrDefault(id, false)) {
+                optedIn.add(id);
+            }
+        }
+        bombPotOptIns.clear();
+
+        GameVariant decided = pendingBombPotVariant;
+        pendingBombPotVariant = null;
+        if (optedIn.size() < 2) {
+            // Not enough takers to actually play a bomb pot - back to voting instead of
+            // dealing a hand nobody can contest, no need to make someone click NEXT_HAND again.
+            votingOpen = true;
+        } else {
+            startBombPotHand(decided, optedIn);
+        }
+        if (onBombPotOptInWindowResolved != null) {
+            onBombPotOptInWindowResolved.run();
+        }
+    }
+
     private void handleVoteGameMode(TableCommandRequest request) {
         findPlayer(request.playerId()); // must be seated to vote; throws otherwise
         if (!votingOpen) {
@@ -306,8 +401,30 @@ public final class Table {
             decided = leaders.get(random.nextInt(leaders.size())); // deadlocked, everyone's voted
         }
         if (decided != null) {
-            startHand(decided);
+            if (isBombPot(decided)) {
+                openBombPotOptInWindow(decided);
+            } else {
+                startHand(decided);
+            }
         }
+    }
+
+    private void openBombPotOptInWindow(GameVariant decided) {
+        pendingBombPotVariant = decided;
+        modeVotes.clear();
+        votingOpen = false;
+        bombPotOptIns.clear();
+        bombPotOptInOpen = true;
+        if (onBombPotOptInWindowOpened != null) {
+            onBombPotOptInWindowOpened.run();
+        }
+    }
+
+    private static boolean isBombPot(GameVariant variant) {
+        return switch (variant) {
+            case TEXAS_HOLDEM, OMAHA -> false;
+            case TEXAS_BOMB_POT, OMAHA_BOMB_POT -> true;
+        };
     }
 
     private boolean isBetweenHands() {
@@ -372,9 +489,14 @@ public final class Table {
         postBlind(round, smallBlindSeat, config.smallBlind());
         postBlind(round, bigBlindSeat, config.bigBlind());
 
+        int holeCardCount = formationRuleFor(variant).holeCardCount();
         for (int idx : inHand) {
             Player p = seats[idx].player();
-            round.holeCards().put(p.id(), new HoleCards(List.of(round.deck().draw(), round.deck().draw())));
+            List<Card> cards = new ArrayList<>();
+            for (int i = 0; i < holeCardCount; i++) {
+                cards.add(round.deck().draw());
+            }
+            round.holeCards().put(p.id(), new HoleCards(cards));
         }
 
         // Guards the same way as dealNextStreet: if both blinds happened to bust a player
@@ -383,8 +505,63 @@ public final class Table {
         beginStreet(round, RoundStage.PREFLOP, firstToAct, config.bigBlind(), config.bigBlind());
     }
 
+    // A bomb pot: only the opted-in players are dealt in, everyone posts a fixed ante instead
+    // of blinds, no preflop betting - both boards' flops go down immediately and the first
+    // live betting round starts straight at FLOP.
+    private void startBombPotHand(GameVariant nextVariant, List<UUID> optedIn) {
+        variant = nextVariant;
+        modeVotes.clear();
+        votingOpen = false;
+
+        for (Seat seat : seats) {
+            Player player = seat.player();
+            if (player != null && player.status() != PlayerStatus.SITTING_OUT) {
+                player.setStatus(PlayerStatus.ACTIVE);
+            }
+        }
+
+        dealerSeat = (dealerSeat < 0) ? firstOccupiedSeatIndex() : nextActiveSeat(dealerSeat);
+
+        GameRound round = new GameRound();
+        currentRound = round;
+        round.deck().shuffle(random);
+        round.boards().add(new ArrayList<>()); // the double-board format's second board
+        round.setSmallBlindSeat(-1); // no blinds this hand - ante only
+        round.setBigBlindSeat(-1);
+
+        for (UUID id : optedIn) {
+            postChipsFromStack(round, findPlayer(id), config.bombPotAnte());
+        }
+        // Unlike a blind, the ante isn't "owed" going into the first betting round - everyone
+        // posted the same amount, so nobody should be facing a bet they still need to call.
+        round.streetContributions().clear();
+
+        int holeCardCount = formationRuleFor(variant).holeCardCount();
+        for (UUID id : optedIn) {
+            List<Card> cards = new ArrayList<>();
+            for (int i = 0; i < holeCardCount; i++) {
+                cards.add(round.deck().draw());
+            }
+            round.holeCards().put(id, new HoleCards(cards));
+        }
+
+        for (List<Card> board : round.boards()) {
+            for (int i = 0; i < 3; i++) {
+                board.add(round.deck().draw());
+            }
+        }
+
+        int firstToAct = seatsThatCanAct(round).isEmpty() ? dealerSeat : nextSeatInHand(round, dealerSeat);
+        beginStreet(round, RoundStage.FLOP, firstToAct, 0, config.bigBlind());
+    }
+
     private void postBlind(GameRound round, int seatIndex, long amount) {
-        Player player = seats[seatIndex].player();
+        postChipsFromStack(round, seats[seatIndex].player(), amount);
+    }
+
+    // Shared by blinds (normal hands) and the ante (bomb pot hands) - both just move up to
+    // `amount` from a player's stack into the pot, capped at whatever they actually have.
+    private void postChipsFromStack(GameRound round, Player player, long amount) {
         long post = Math.min(amount, player.stack());
         player.removeFromStack(post);
         round.pot().contribute(player.id(), post);
@@ -399,6 +576,7 @@ public final class Table {
         round.setStage(stage);
         round.setCurrentBet(openingBet);
         round.setLastRaiseSize(openingMinRaise);
+        round.lastActionByPlayer().clear(); // new street - nobody's acted on it yet
         round.toAct().clear();
         for (int idx : seatsThatCanAct(round)) {
             round.toAct().add(seats[idx].player().id());
@@ -418,15 +596,41 @@ public final class Table {
     private void dealNextStreet(GameRound round) {
         RoundStage next = nextStreetAfter(round.stage());
         int cardsToDeal = (next == RoundStage.FLOP) ? 3 : 1;
-        for (int i = 0; i < cardsToDeal; i++) {
-            round.board().add(round.deck().draw());
+        for (List<Card> board : round.boards()) {
+            for (int i = 0; i < cardsToDeal; i++) {
+                board.add(round.deck().draw());
+            }
         }
         round.streetContributions().clear();
         // If nobody can act (everyone still in the hand is already all-in), there's no
         // "first to act" - beginStreet detects that and runs the rest out; this value is
         // never actually used in that case, so a harmless placeholder is fine.
-        int firstToAct = seatsThatCanAct(round).isEmpty() ? dealerSeat : nextActiveSeat(dealerSeat);
+        int firstToAct = seatsThatCanAct(round).isEmpty() ? dealerSeat : firstToActForNextStreet(round);
         beginStreet(round, next, firstToAct, 0, config.bigBlind());
+    }
+
+    // Normal hands: first active seat left of the button acts first postflop (unchanged).
+    // Bomb pots: same rule for every betting round, since there's no blind-based order to
+    // fall back on - the button is the only positional anchor a bomb pot hand has.
+    private int firstToActForNextStreet(GameRound round) {
+        return isBombPot(variant) ? nextSeatInHand(round, dealerSeat) : nextActiveSeat(dealerSeat);
+    }
+
+    // First seat clockwise from `from` that's both still in the hand (ACTIVE/ALL_IN) and
+    // actually dealt into this round - unlike nextActiveSeat, excludes anyone not holding
+    // cards this hand (a bomb pot's opted-out players keep their normal ACTIVE status but
+    // were never dealt in, same as seatsInHand/seatsThatCanAct already exclude them).
+    private int nextSeatInHand(GameRound round, int from) {
+        int n = seats.length;
+        for (int step = 1; step <= n; step++) {
+            int idx = (from + step) % n;
+            Player p = seats[idx].player();
+            if (p != null && round.holeCards().containsKey(p.id())
+                    && (p.status() == PlayerStatus.ACTIVE || p.status() == PlayerStatus.ALL_IN)) {
+                return idx;
+            }
+        }
+        throw new IllegalStateException("no seat left in hand");
     }
 
     private RoundStage nextStreetAfter(RoundStage stage) {
@@ -452,8 +656,10 @@ public final class Table {
         while (round.stage() != RoundStage.RIVER) {
             RoundStage next = nextStreetAfter(round.stage());
             int cardsToDeal = (next == RoundStage.FLOP) ? 3 : 1;
-            for (int i = 0; i < cardsToDeal; i++) {
-                round.board().add(round.deck().draw());
+            for (List<Card> board : round.boards()) {
+                for (int i = 0; i < cardsToDeal; i++) {
+                    board.add(round.deck().draw());
+                }
             }
             round.setStage(next);
         }
@@ -568,6 +774,10 @@ public final class Table {
             }
         }
 
+        // One common point for every action type - what the UI shows next to a seat is
+        // exactly what actually happened, not a per-branch guess.
+        round.lastActionByPlayer().put(player.id(), action.type());
+
         if (seatsInHand(round).size() <= 1) {
             awardUncontestedPot(round);
             return;
@@ -617,7 +827,12 @@ public final class Table {
     private void awardUncontestedPot(GameRound round) {
         UUID winner = seats[firstSeatInHand(round)].player().id();
         findPlayer(winner).addToStack(round.pot().total());
-        round.winners().add(winner);
+        // No hands were ever compared (everyone else folded), so there's nothing board-
+        // specific about this win - record it against every board that exists so the UI's
+        // per-board crown shows up regardless of board count.
+        for (int i = 0; i < round.boards().size(); i++) {
+            round.winnersByBoard().add(new HashSet<>(Set.of(winner)));
+        }
         completeHand(round);
     }
 
@@ -631,13 +846,35 @@ public final class Table {
             }
         }
 
+        int boardCount = round.boards().size();
+        for (int i = 0; i < boardCount; i++) {
+            round.bestFiveByBoard().add(new HashMap<>());
+            round.winnersByBoard().add(new HashSet<>());
+        }
+
         for (Pot.SidePot sidePot : round.pot().resolve(folded)) {
-            List<UUID> winners = bestHandWinners(round, sidePot.eligiblePlayers());
-            splitPotAmongWinners(sidePot.amount(), winners);
-            round.winners().addAll(winners);
+            long[] shares = splitEvenly(sidePot.amount(), boardCount);
+            for (int i = 0; i < boardCount; i++) {
+                List<UUID> winners = bestHandWinners(round, sidePot.eligiblePlayers(), i);
+                splitPotAmongWinners(shares[i], winners);
+                round.winnersByBoard().get(i).addAll(winners);
+            }
         }
 
         completeHand(round);
+    }
+
+    // Splits an amount evenly across N boards - a single board just gets the whole amount.
+    // Any remainder chip(s) from an odd split go to board 0, same "first board" tiebreak the
+    // wire/UI treats as primary.
+    private static long[] splitEvenly(long amount, int parts) {
+        long[] shares = new long[parts];
+        long base = amount / parts;
+        long remainder = amount % parts;
+        for (int i = 0; i < parts; i++) {
+            shares[i] = base + (i < remainder ? 1 : 0);
+        }
+        return shares;
     }
 
     private void completeHand(GameRound round) {
@@ -648,15 +885,30 @@ public final class Table {
         finishHand();
     }
 
-    private List<UUID> bestHandWinners(GameRound round, Set<UUID> eligiblePlayers) {
+    private static HandFormationRule formationRuleFor(GameVariant variant) {
+        return switch (variant) {
+            case TEXAS_HOLDEM, TEXAS_BOMB_POT -> HOLDEM_RULE;
+            case OMAHA, OMAHA_BOMB_POT -> OMAHA_RULE;
+        };
+    }
+
+    private static final HandFormationRule HOLDEM_RULE = new HoldemFormationRule();
+    private static final HandFormationRule OMAHA_RULE = new OmahaFormationRule();
+
+    // Evaluated per board - for a double-board bomb pot this runs once per board with the
+    // same formation rule and hole cards each time, so e.g. Omaha's "use the same 2 cards on
+    // both boards if that's genuinely best" just falls out for free from two independent
+    // per-board optimizations, no special-casing needed.
+    private List<UUID> bestHandWinners(GameRound round, Set<UUID> eligiblePlayers, int boardIndex) {
+        HandFormationRule rule = formationRuleFor(variant);
+        List<Card> board = round.boards().get(boardIndex);
         Map<UUID, EvaluatedHand> evaluated = new HashMap<>();
         EvaluatedHand best = null;
         for (UUID id : eligiblePlayers) {
-            List<Card> sevenCards = new ArrayList<>(round.holeCards().get(id).cards());
-            sevenCards.addAll(round.board());
-            EvaluatedHand hand = HandEvaluator.evaluate(sevenCards);
+            List<Card> holeCards = round.holeCards().get(id).cards();
+            EvaluatedHand hand = rule.evaluate(holeCards, board);
             evaluated.put(id, hand);
-            round.bestFiveByPlayer().put(id, hand.cards());
+            round.bestFiveByBoard().get(boardIndex).put(id, hand.cards());
             if (best == null || hand.compareTo(best) > 0) {
                 best = hand;
             }

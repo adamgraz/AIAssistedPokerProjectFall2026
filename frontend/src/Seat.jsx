@@ -1,20 +1,33 @@
 import { Card } from "./Card";
 import { sortHighToLow } from "./cards";
 
-export function Seat({ seat, table, round, isYou, isActing, isComplete, canKick, onKick }) {
+const ACTION_LABELS = { FOLD: "Folded", CHECK: "Checked", CALL: "Called", BET: "Bet", RAISE: "Raised", ALL_IN: "All in" };
+
+export function Seat({ seat, table, round, isYou, isActing, isComplete, canKick, onKick, hideLastHandCards }) {
   const player = seat.player;
   const isDealer = table.dealerSeat === seat.index;
   const isSmallBlind = round?.smallBlindSeat === seat.index;
   const isBigBlind = round?.bigBlindSeat === seat.index;
 
   // Your own hole cards are always visible to you; everyone else's are only ever revealed
-  // once the hand reaches COMPLETE and they didn't fold (round.revealedHoleCards).
-  const holeCards = isYou ? round?.yourHoleCards ?? [] : round?.revealedHoleCards?.[player.id] ?? [];
-  // Only populated at a real showdown - never for an uncontested fold win. HandEvaluator
-  // returns these in whatever order the winning 5-card combination happened to land in, so
-  // sort for display - high to low reads as "the hand" the way a person would lay it out.
-  const bestFive = isComplete ? sortHighToLow(round?.bestFive?.[player.id] ?? []) : [];
-  const isWinner = isComplete && (round?.winners ?? []).includes(player.id);
+  // once the hand reaches COMPLETE and they didn't fold (round.revealedHoleCards). During a
+  // bomb pot's opt-in window, currentRound is still last hand's COMPLETE round - hiding these
+  // avoids the last hand's cards bleeding into an opt-in decision that's about the next one.
+  const holeCards = hideLastHandCards
+    ? []
+    : isYou ? round?.yourHoleCards ?? [] : round?.revealedHoleCards?.[player.id] ?? [];
+  // Only populated at a real showdown - never for an uncontested fold win. One entry per
+  // board (just one for every variant except a bomb pot's double-board format). HandEvaluator
+  // returns each board's cards in whatever order the winning 5-card combination happened to
+  // land in, so sort for display - high to low reads as "the hand" the way a person would lay it out.
+  const bestFiveByBoard = isComplete && !hideLastHandCards
+    ? (round?.bestFiveByBoard ?? []).map((board) => sortHighToLow(board[player.id] ?? []))
+    : [];
+  const winnersByBoard = round?.winnersByBoard ?? [];
+  const isWinner = isComplete && !hideLastHandCards && winnersByBoard.some((winners) => winners.includes(player.id));
+  // Cleared server-side at the start of every street, so this only ever reflects the
+  // CURRENT street's action - never a stale leftover from an earlier one.
+  const lastAction = !isComplete && !hideLastHandCards ? round?.lastActionByPlayer?.[player.id] : undefined;
 
   return (
     <div className={`seat ${isActing ? "acting" : ""} ${isYou ? "you" : ""}`}>
@@ -32,6 +45,7 @@ export function Seat({ seat, table, round, isYou, isActing, isComplete, canKick,
       </div>
       <div className="seat-stack">{player.stack} chips</div>
       <div className="seat-status">{player.status}</div>
+      {lastAction && <div className="seat-last-action">{ACTION_LABELS[lastAction] ?? lastAction}</div>}
       {!isYou && !player.connected && canKick && (
         <button className="kick-button" onClick={() => onKick(player.id)}>Remove seat</button>
       )}
@@ -42,16 +56,18 @@ export function Seat({ seat, table, round, isYou, isActing, isComplete, canKick,
           ))}
         </div>
       )}
-      {bestFive.length > 0 && (
-        <div className="best-five">
-          <span className="best-five-label">Best hand</span>
+      {bestFiveByBoard.map((bestFive, boardIndex) => bestFive.length > 0 && (
+        <div key={boardIndex} className="best-five">
+          <span className="best-five-label">
+            Best hand{bestFiveByBoard.length > 1 ? ` (Board ${String.fromCharCode(65 + boardIndex)})` : ""}
+          </span>
           <div className="hole-cards">
             {bestFive.map((card, i) => (
               <Card key={i} card={card} />
             ))}
           </div>
         </div>
-      )}
+      ))}
     </div>
   );
 }
