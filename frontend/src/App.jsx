@@ -19,10 +19,19 @@ const LIVE_STAGES = ["PREFLOP", "FLOP", "TURN", "RIVER"];
 const BOMB_POT_OPT_IN_SECONDS = 60;
 
 function App() {
-  const { connected, reconnectFailed, playerId, table, lastError, send, availableModes } = useGameSocket();
+  const { connected, reconnectFailed, playerId, table, lastError, send, availableModes, profile } = useGameSocket();
   const [displayName, setDisplayName] = useState("Player");
   const [buyIn, setBuyIn] = useState(1000);
   const [betAmount, setBetAmount] = useState(20);
+  const [passphrase, setPassphrase] = useState("");
+  const [showCreateProfile, setShowCreateProfile] = useState(false);
+  const [newDisplayName, setNewDisplayName] = useState("");
+
+  // Logging in fills in the sit-down name for free - still just a starting point, the field
+  // stays editable same as it always was for guests.
+  useEffect(() => {
+    if (profile) setDisplayName(profile.displayName);
+  }, [profile]);
 
   const round = table?.round ?? null;
   const mySeat = table?.seats.find((s) => s.player?.id === playerId) ?? null;
@@ -212,6 +221,49 @@ function App() {
             Rebuy
           </button>
         </div>
+      )}
+
+      {!isSeated && !profile && (
+        <div className="controls login-panel">
+          <h2>Log in (optional - guest play works without it)</h2>
+          <input
+            type="password"
+            placeholder="Passphrase"
+            value={passphrase}
+            onChange={(e) => setPassphrase(e.target.value)}
+          />
+          <button
+            disabled={!connected || !passphrase}
+            onClick={() => send("LOGIN", { passphrase })}
+          >
+            Log in
+          </button>
+          <button className="link-button" onClick={() => setShowCreateProfile((v) => !v)}>
+            {showCreateProfile ? "Cancel" : "New here? Create a profile"}
+          </button>
+          {showCreateProfile && (
+            <div className="create-profile-row">
+              <input
+                placeholder="Display name"
+                value={newDisplayName}
+                onChange={(e) => setNewDisplayName(e.target.value)}
+              />
+              <button
+                disabled={!connected || !passphrase || !newDisplayName}
+                onClick={() => send("CREATE_PROFILE", { passphrase, displayName: newDisplayName })}
+              >
+                Create profile
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {profile && !isSeated && (
+        <p className="profile-status">
+          Logged in as <strong>{profile.displayName}</strong> — {profile.handsPlayed} hands played,
+          net {profile.netChips >= 0 ? "+" : ""}{profile.netChips} chips
+        </p>
       )}
 
       {!isSeated && (

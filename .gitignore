@@ -1,5 +1,11 @@
 .gradle
 build/
+
+### SQLite runtime state - db/poker.ddl (the schema) stays committed ###
+db/*.db
+db/*.db-journal
+db/*.db-wal
+db/*.db-shm
 !gradle/wrapper/gradle-wrapper.jar
 !**/src/main/**/build/
 !**/src/test/**/build/

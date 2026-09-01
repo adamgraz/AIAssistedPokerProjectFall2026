@@ -27,6 +27,9 @@ export function useGameSocket() {
   const [table, setTable] = useState(null);
   const [lastError, setLastError] = useState(null);
   const [availableModes, setAvailableModes] = useState([]);
+  // null = playing as a guest (the default, unchanged from before login existed). Set only
+  // when a WELCOME carries profile fields - i.e. after a successful LOGIN/CREATE_PROFILE.
+  const [profile, setProfile] = useState(null);
 
   useEffect(() => {
     unmountedRef.current = false;
@@ -83,6 +86,16 @@ export function useGameSocket() {
           case "WELCOME":
             setPlayerId(envelope.payload.playerId);
             setAvailableModes(envelope.payload.availableModes ?? []);
+            setProfile(
+              envelope.payload.displayName
+                ? {
+                    displayName: envelope.payload.displayName,
+                    handsPlayed: envelope.payload.handsPlayed,
+                    netChips: envelope.payload.netChips,
+                  }
+                : null
+            );
+            setLastError(null); // a failed LOGIN/CREATE_PROFILE's ERROR shouldn't linger past a later WELCOME
             break;
           case "STATE":
             setTable(envelope.payload);
@@ -113,5 +126,5 @@ export function useGameSocket() {
     socketRef.current.send(JSON.stringify({ type, payload }));
   }
 
-  return { connected, reconnectFailed, playerId, table, lastError, send, availableModes };
+  return { connected, reconnectFailed, playerId, table, lastError, send, availableModes, profile };
 }

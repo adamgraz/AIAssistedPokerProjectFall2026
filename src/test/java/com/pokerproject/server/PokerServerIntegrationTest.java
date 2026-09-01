@@ -2,11 +2,13 @@ package com.pokerproject.server;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.pokerproject.db.DB;
 import com.pokerproject.domain.GameConfig;
 import com.pokerproject.domain.Table;
 import com.pokerproject.protocol.GameVariant;
 import io.javalin.Javalin;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.net.URI;
@@ -29,6 +31,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class PokerServerIntegrationTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    // A completed hand or a vacated seat now touches the database (Profile.findByUuid, see
+    // PokerServer's onHandComplete/onPlayerLeftSeat hooks) - the schema has to exist before
+    // that first happens, or those hooks throw on a missing table instead of a clean
+    // empty-Optional guest case.
+    @BeforeAll
+    static void useTestDatabase() {
+        DB.useTestMode();
+        DB.reset();
+    }
 
     private Javalin app;
 
@@ -300,6 +312,62 @@ class PokerServerIntegrationTest {
             }
         }
         assertFalse(bStillSeated);
+    }
+
+    // Proves the login/guest-upgrade path end to end: CREATE_PROFILE isn't a gate (the
+    // connection was already a working guest before it), LOGIN from a fresh connection reclaims
+    // the same identity by passphrase alone, and a second simultaneous LOGIN for that same
+    // profile is rejected rather than letting two connections share one identity.
+    @Test
+    void createProfileThenLoginReclaimsTheSameIdentityAndBlocksASimultaneousSecondLogin() throws Exception {
+        Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
+        app = new PokerServer(table).start(0);
+        String url = "ws://localhost:" + app.port() + "/ws";
+
+        TestClient a = new TestClient(url);
+        a.next(); // WELCOME - guest identity, about to be upgraded
+
+        a.send("{\"type\":\"CREATE_PROFILE\",\"payload\":{\"passphrase\":\"hunter2\",\"displayName\":\"Alice\"}}");
+        JsonNode created = a.next();
+        assertEquals("WELCOME", created.path("type").asText());
+        assertEquals("Alice", created.path("payload").path("displayName").asText());
+        assertEquals(0, created.path("payload").path("handsPlayed").asLong());
+        String profileUuid = created.path("payload").path("playerId").asText();
+
+        // A duplicate CREATE_PROFILE for the same passphrase is rejected - the create-race
+        // guard (synchronized(table) around check-then-insert) covers this even single-threaded.
+        TestClient dupe = new TestClient(url);
+        dupe.next();
+        dupe.send("{\"type\":\"CREATE_PROFILE\",\"payload\":{\"passphrase\":\"hunter2\",\"displayName\":\"Someone Else\"}}");
+        assertEquals("ERROR", dupe.next().path("type").asText());
+        dupe.close();
+
+        a.close();
+
+        // A fresh connection logging in with the same passphrase reclaims the same identity -
+        // retried the same way REMOVE_PLAYER's close-then-act test above does, since the
+        // registry update happens on Javalin's own thread, asynchronously to this test.
+        TestClient reconnected = new TestClient(url);
+        reconnected.next(); // WELCOME - a new guest identity for this socket, about to be replaced
+        JsonNode loggedIn = null;
+        for (int i = 0; i < 20 && loggedIn == null; i++) {
+            reconnected.send("{\"type\":\"LOGIN\",\"payload\":{\"passphrase\":\"hunter2\"}}");
+            JsonNode result = reconnected.next();
+            if (!"ERROR".equals(result.path("type").asText())) {
+                loggedIn = result;
+            } else {
+                Thread.sleep(50);
+            }
+        }
+        assertNotNull(loggedIn, "LOGIN never succeeded after the original connection closed");
+        assertEquals(profileUuid, loggedIn.path("payload").path("playerId").asText());
+
+        // While that connection is still live, a second LOGIN for the same profile is rejected -
+        // not just a second CREATE_PROFILE.
+        TestClient intruder = new TestClient(url);
+        intruder.next();
+        intruder.send("{\"type\":\"LOGIN\",\"payload\":{\"passphrase\":\"hunter2\"}}");
+        assertEquals("ERROR", intruder.next().path("type").asText());
     }
 
     // Stacks alone aren't stable across this call - if the hand chained into a new one,

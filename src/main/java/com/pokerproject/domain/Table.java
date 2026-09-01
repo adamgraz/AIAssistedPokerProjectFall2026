@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.BiConsumer;
 
 public final class Table {
 
@@ -29,6 +30,11 @@ public final class Table {
     private final Set<UUID> pendingLeaves = new HashSet<>();
     private boolean pendingClose;
     private Runnable onHandComplete;
+    // Fires from inside removeFromSeat with the final Player state (stack, totalBuyIn) still
+    // intact - the one place every leave/kick path (LEAVE_TABLE, REMOVE_PLAYER, finishHand's
+    // pending-leaves cleanup) already funnels through, so persistence only needs one hook here
+    // rather than one per caller.
+    private BiConsumer<UUID, Player> onPlayerLeftSeat;
 
     // Votes for which GameVariant the NEXT hand should use. Only accepted while votingOpen -
     // a player opens the window with NEXT_HAND once the previous hand has finished; the moment
@@ -112,6 +118,10 @@ public final class Table {
     // that would otherwise never go out, since finishHand() runs synchronously inside apply().
     public void setOnHandComplete(Runnable listener) {
         this.onHandComplete = listener;
+    }
+
+    public void setOnPlayerLeftSeat(BiConsumer<UUID, Player> listener) {
+        this.onPlayerLeftSeat = listener;
     }
 
     // Fires the moment a bomb pot variant is decided and the opt-in window opens - the wire
@@ -438,6 +448,9 @@ public final class Table {
             Player p = seat.player();
             if (p != null && p.id().equals(playerId)) {
                 seat.setPlayer(null);
+                if (onPlayerLeftSeat != null) {
+                    onPlayerLeftSeat.accept(playerId, p);
+                }
                 return;
             }
         }

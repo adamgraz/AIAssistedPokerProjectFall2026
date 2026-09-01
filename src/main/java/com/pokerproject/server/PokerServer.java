@@ -4,9 +4,14 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.pokerproject.db.DB;
+import com.pokerproject.db.PasswordHasher;
+import com.pokerproject.db.Profile;
 import com.pokerproject.domain.GameConfig;
+import com.pokerproject.domain.Player;
 import com.pokerproject.domain.Table;
 import com.pokerproject.protocol.ActionType;
+import com.pokerproject.protocol.AuthCommand;
 import com.pokerproject.protocol.Envelope;
 import com.pokerproject.protocol.GameVariant;
 import com.pokerproject.protocol.PlayerAction;
@@ -57,9 +62,33 @@ public final class PokerServer {
 
     public PokerServer(Table table) {
         this.table = table;
-        table.setOnHandComplete(this::broadcastState);
+        table.setOnHandComplete(() -> {
+            recordHandsPlayed();
+            broadcastState();
+        });
+        table.setOnPlayerLeftSeat(this::recordNetChipsOnLeave);
         table.setOnBombPotOptInWindowOpened(this::scheduleBombPotOptInTimeout);
         table.setOnBombPotOptInWindowResolved(this::cancelBombPotOptInTimer);
+    }
+
+    // Every player dealt into the hand that just completed - folded or not, showdown or not,
+    // since onHandComplete fires identically either way. A guest's empty Optional just means
+    // the lambda never runs, no branch to remember at the call site.
+    private void recordHandsPlayed() {
+        var round = table.currentRound();
+        if (round == null) {
+            return;
+        }
+        for (UUID playerId : round.holeCards().keySet()) {
+            Profile.findByUuid(playerId).ifPresent(Profile::recordHandPlayed);
+        }
+    }
+
+    // Fires once per profile, at the moment their seat is actually vacated - not per hand, so
+    // mid-session rebuys never get double-counted as "winnings".
+    private void recordNetChipsOnLeave(UUID playerId, Player player) {
+        Profile.findByUuid(playerId).ifPresent(profile ->
+                profile.recordNetChips(player.stack() - player.totalBuyIn()));
     }
 
     // Scheduled once per opt-in window, the moment it opens. If the window resolves early
@@ -94,14 +123,27 @@ public final class PokerServer {
         return app.start(port);
     }
 
+    // Guest by default, unchanged from before login existed: a fresh random UUID, zero
+    // friction, no backing Profile row. LOGIN/CREATE_PROFILE (below) aren't a gate in front of
+    // this - they're optional messages a client can send later to upgrade this connection's
+    // identity to a profile-backed one.
     private void onConnect(WsConnectContext ctx) {
         UUID playerId = UUID.randomUUID();
         connections.put(ctx, playerId);
+        sendWelcome(ctx, playerId, null);
+    }
+
+    private void sendWelcome(WsContext ctx, UUID playerId, Profile profile) {
         ObjectNode payload = MAPPER.createObjectNode();
         payload.put("playerId", playerId.toString());
         ArrayNode modes = payload.putArray("availableModes");
         for (GameVariant variant : GameVariant.values()) {
             modes.add(variant.name());
+        }
+        if (profile != null) {
+            payload.put("displayName", profile.getDisplayName());
+            payload.put("handsPlayed", profile.getHandsPlayed());
+            payload.put("netChips", profile.getNetChips());
         }
         ctx.send(new Envelope("WELCOME", payload));
     }
@@ -135,7 +177,7 @@ public final class PokerServer {
 
         synchronized (table) {
             try {
-                dispatch(playerId, envelope);
+                dispatch(ctx, playerId, envelope);
             } catch (IllegalStateException e) {
                 sendError(ctx, e.getMessage());
                 return;
@@ -144,11 +186,13 @@ public final class PokerServer {
         }
     }
 
-    private void dispatch(UUID playerId, Envelope envelope) {
+    private void dispatch(WsContext ctx, UUID playerId, Envelope envelope) {
         String type = envelope.type();
         JsonNode payload = envelope.payload() != null ? envelope.payload() : MAPPER.createObjectNode();
 
-        if (isTableCommand(type)) {
+        if (isAuthCommand(type)) {
+            handleAuthCommand(ctx, AuthCommand.valueOf(type), payload);
+        } else if (isTableCommand(type)) {
             String displayName = payload.path("displayName").asText(null);
             long amount = payload.path("amount").asLong(0);
             String gameVariant = payload.path("mode").asText(null);
@@ -166,6 +210,48 @@ public final class PokerServer {
         }
     }
 
+    // LOGIN/CREATE_PROFILE never reach Table.apply(...) - Table has no notion of profiles or
+    // passphrases. Both run inside the same synchronized(table) block as everything else,
+    // which is what closes two races that would otherwise exist: two people claiming the same
+    // brand-new passphrase at once (a database UNIQUE constraint can't catch this - PBKDF2
+    // salts every hash, so the same passphrase hashed twice never produces the same stored
+    // value), and the same profile logging in from two connections at once.
+    private void handleAuthCommand(WsContext ctx, AuthCommand command, JsonNode payload) {
+        String passphrase = payload.path("passphrase").asText(null);
+        if (passphrase == null || passphrase.isBlank()) {
+            throw new IllegalStateException("passphrase is required");
+        }
+        Profile profile = switch (command) {
+            case LOGIN -> {
+                Profile found = Profile.findByPassphrase(passphrase);
+                if (found == null) {
+                    throw new IllegalStateException("unknown passphrase");
+                }
+                yield found;
+            }
+            case CREATE_PROFILE -> {
+                String displayName = payload.path("displayName").asText(null);
+                if (displayName == null || displayName.isBlank()) {
+                    throw new IllegalStateException("display name is required");
+                }
+                if (Profile.findByPassphrase(passphrase) != null) {
+                    throw new IllegalStateException("that passphrase is already taken");
+                }
+                Profile created = new Profile(displayName, PasswordHasher.hash(passphrase));
+                created.create();
+                yield created;
+            }
+        };
+
+        // verifyTargetIsOrphaned's check, reused in reverse: reject a login for an identity
+        // that's already live on another connection instead of letting a second one claim it.
+        if (connections.containsValue(profile.getPlayerUuid())) {
+            throw new IllegalStateException("that profile is already logged in elsewhere");
+        }
+        connections.put(ctx, profile.getPlayerUuid());
+        sendWelcome(ctx, profile.getPlayerUuid(), profile);
+    }
+
     // The one piece of business logic at this layer: only PokerServer knows which playerIds
     // have a live connection right now (connections' values), Table has no notion of a
     // connection at all - so this has to be checked here, before the command ever reaches it.
@@ -178,6 +264,15 @@ public final class PokerServer {
         }
         if (connections.containsValue(target)) {
             throw new IllegalStateException("that player is still connected - can't remove them");
+        }
+    }
+
+    private boolean isAuthCommand(String type) {
+        try {
+            AuthCommand.valueOf(type);
+            return true;
+        } catch (IllegalArgumentException | NullPointerException e) {
+            return false;
         }
     }
 
@@ -214,6 +309,7 @@ public final class PokerServer {
     }
 
     public static void main(String[] args) {
+        DB.initSchema();
         // 9 seats, 5/10 blinds, 10-chip bomb pot ante - change a value, restart the instance
         // (see GameConfig's own doc comment; no live reload, no CLI/env config by design).
         Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 10));

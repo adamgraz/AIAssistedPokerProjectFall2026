@@ -371,6 +371,36 @@
   cursor: not-allowed;
 }
 
+/* --- login / profile --- */
+
+.login-panel {
+  margin-bottom: 12px;
+}
+
+.link-button {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+}
+
+.create-profile-row {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.profile-status {
+  font-size: 13px;
+  color: var(--text);
+  margin: 0 0 12px;
+}
+
 /* --- final stats modal --- */
 
 .modal-overlay {
