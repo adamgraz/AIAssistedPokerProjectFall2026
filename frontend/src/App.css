@@ -237,6 +237,18 @@
   font-size: 13px;
 }
 
+.toggle-cards-button {
+  display: block;
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 10px;
+  background: var(--code-bg);
+  color: var(--text-h);
+  font-size: 12px;
+  cursor: pointer;
+}
+
 .best-five {
   margin-top: 8px;
   padding-top: 8px;

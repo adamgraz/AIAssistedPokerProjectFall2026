@@ -3,7 +3,19 @@ import { sortHighToLow } from "./cards";
 
 const ACTION_LABELS = { FOLD: "Folded", CHECK: "Checked", CALL: "Called", BET: "Bet", RAISE: "Raised", ALL_IN: "All in" };
 
-export function Seat({ seat, table, round, isYou, isActing, isComplete, canKick, onKick, hideLastHandCards }) {
+export function Seat({
+  seat,
+  table,
+  round,
+  isYou,
+  isActing,
+  isComplete,
+  canKick,
+  onKick,
+  hideLastHandCards,
+  cardsVisible,
+  onToggleCardsVisible,
+}) {
   const player = seat.player;
   const isDealer = table.dealerSeat === seat.index;
   const isSmallBlind = round?.smallBlindSeat === seat.index;
@@ -52,9 +64,14 @@ export function Seat({ seat, table, round, isYou, isActing, isComplete, canKick,
       {holeCards.length > 0 && (
         <div className="hole-cards">
           {holeCards.map((card, i) => (
-            <Card key={i} card={card} />
+            <Card key={i} card={card} faceDown={isYou && !cardsVisible} />
           ))}
         </div>
+      )}
+      {isYou && holeCards.length > 0 && (
+        <button className="toggle-cards-button" onClick={onToggleCardsVisible}>
+          {cardsVisible ? "Hide cards" : "Show cards"}
+        </button>
       )}
       {bestFiveByBoard.map((bestFive, boardIndex) => bestFive.length > 0 && (
         <div key={boardIndex} className="best-five">

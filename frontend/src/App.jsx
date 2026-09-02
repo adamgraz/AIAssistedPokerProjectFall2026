@@ -34,6 +34,16 @@ function App() {
   }, [profile]);
 
   const round = table?.round ?? null;
+
+  // Hidden by default - so a player at a real table isn't stuck shielding their phone screen
+  // from the person next to them. Keyed off the actual card values (not round.stage or object
+  // identity, which change on every broadcast) so this only resets when a new hand actually
+  // deals new cards, not on every other player's action during the same hand.
+  const [cardsVisible, setCardsVisible] = useState(false);
+  const yourHoleCardsKey = JSON.stringify(round?.yourHoleCards ?? []);
+  useEffect(() => {
+    setCardsVisible(false);
+  }, [yourHoleCardsKey]);
   const mySeat = table?.seats.find((s) => s.player?.id === playerId) ?? null;
   const isSeated = mySeat !== null;
   const isLiveBettingStage = round !== null && LIVE_STAGES.includes(round.stage);
@@ -134,6 +144,8 @@ function App() {
             isActing={isLiveBettingStage && round.actingSeat === seat.index}
             isComplete={isComplete}
             hideLastHandCards={bombPotOptInOpen}
+            cardsVisible={cardsVisible}
+            onToggleCardsVisible={() => setCardsVisible((v) => !v)}
             canKick={isSeated}
             onKick={(targetId) => send("REMOVE_PLAYER", { targetPlayerId: targetId })}
           />
