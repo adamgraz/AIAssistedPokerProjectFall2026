@@ -7,8 +7,10 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.pokerproject.db.DB;
 import com.pokerproject.db.PasswordHasher;
 import com.pokerproject.db.Profile;
+import com.pokerproject.db.TableState;
 import com.pokerproject.domain.GameConfig;
 import com.pokerproject.domain.Player;
+import com.pokerproject.domain.Seat;
 import com.pokerproject.domain.Table;
 import com.pokerproject.protocol.ActionType;
 import com.pokerproject.protocol.AuthCommand;
@@ -64,9 +66,12 @@ public final class PokerServer {
         this.table = table;
         table.setOnHandComplete(() -> {
             recordHandsPlayed();
+            snapshotAllSeated();
             broadcastState();
         });
         table.setOnPlayerLeftSeat(this::recordNetChipsOnLeave);
+        table.setOnRebuy((playerId, player) -> snapshotSeat(player));
+        table.setOnTableClosed(TableState::clearAll);
         table.setOnBombPotOptInWindowOpened(this::scheduleBombPotOptInTimeout);
         table.setOnBombPotOptInWindowResolved(this::cancelBombPotOptInTimer);
     }
@@ -84,11 +89,30 @@ public final class PokerServer {
         }
     }
 
+    // table_state's crash-recovery snapshot, refreshed after every hand and every rebuy -
+    // both guest and profile-backed players get one, since a guest's stack is exactly as much
+    // at risk from a crash as a logged-in player's (see TableState).
+    private void snapshotAllSeated() {
+        for (Seat seat : table.seats()) {
+            Player player = seat.player();
+            if (player != null) {
+                snapshotSeat(player);
+            }
+        }
+    }
+
+    private void snapshotSeat(Player player) {
+        TableState.snapshot(player.id(), player.displayName(), player.stack(), player.totalBuyIn());
+    }
+
     // Fires once per profile, at the moment their seat is actually vacated - not per hand, so
-    // mid-session rebuys never get double-counted as "winnings".
+    // mid-session rebuys never get double-counted as "winnings". The table_state row is
+    // deleted here too - once a result is permanently recorded, the scratch copy has to go, or
+    // a re-seated guest UUID could inherit someone else's stale row.
     private void recordNetChipsOnLeave(UUID playerId, Player player) {
         Profile.findByUuid(playerId).ifPresent(profile ->
                 profile.recordNetChips(player.stack() - player.totalBuyIn()));
+        TableState.deleteFor(playerId);
     }
 
     // Scheduled once per opt-in window, the moment it opens. If the window resolves early
@@ -308,11 +332,38 @@ public final class PokerServer {
         ctx.send(new Envelope("ERROR", payload));
     }
 
+    // Restores whatever table_state still remembers before the first connection is accepted.
+    // Reuses the normal SIT_DOWN path (same validation, same seat-picking, same Player
+    // construction the wire protocol already uses) instead of a parallel seating mechanism -
+    // then patches the stack up/down from the buy-in SIT_DOWN just set, since rebuy is the
+    // only existing way to grow totalBuyIn and stack together. Doesn't attempt to restore seat
+    // ordering, dealer position, or an in-progress hand - only "nobody's chip count is ever
+    // permanently lost" is in scope (see persistence-design.html).
+    // Package-private, not private: PokerServerIntegrationTest calls this directly against a
+    // freshly constructed Table, so the crash-recovery path is provable without an actual
+    // process restart.
+    static void rehydrateTableState(Table table) {
+        TableState.pruneStale();
+        for (TableState.Row row : TableState.all()) {
+            table.apply(new TableCommandRequest(
+                    row.playerUuid(), TableCommand.SIT_DOWN, row.displayName(), row.totalBuyIn(), null, null));
+            Player player = table.roster().stream()
+                    .filter(p -> p.id().equals(row.playerUuid()))
+                    .findFirst()
+                    .orElseThrow();
+            long adjustment = row.stack() - row.totalBuyIn();
+            if (adjustment != 0) {
+                player.addToStack(adjustment);
+            }
+        }
+    }
+
     public static void main(String[] args) {
         DB.initSchema();
         // 9 seats, 5/10 blinds, 10-chip bomb pot ante - change a value, restart the instance
         // (see GameConfig's own doc comment; no live reload, no CLI/env config by design).
         Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 10));
+        rehydrateTableState(table);
         new PokerServer(table).start();
     }
 }

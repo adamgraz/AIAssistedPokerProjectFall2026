@@ -3,17 +3,24 @@ package com.pokerproject.server;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.pokerproject.db.DB;
+import com.pokerproject.db.TableState;
 import com.pokerproject.domain.GameConfig;
+import com.pokerproject.domain.Player;
+import com.pokerproject.domain.PlayerStatus;
+import com.pokerproject.domain.Seat;
 import com.pokerproject.domain.Table;
 import com.pokerproject.protocol.GameVariant;
 import io.javalin.Javalin;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
+import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -39,6 +46,13 @@ class PokerServerIntegrationTest {
     @BeforeAll
     static void useTestDatabase() {
         DB.useTestMode();
+    }
+
+    // Per-test reset, not just the one-time BeforeAll - the new table_state assertions below
+    // count rows exactly, which only holds if each test starts from an empty table, same
+    // reasoning ProfileTest already follows.
+    @BeforeEach
+    void freshSchema() {
         DB.reset();
     }
 
@@ -368,6 +382,313 @@ class PokerServerIntegrationTest {
         intruder.next();
         intruder.send("{\"type\":\"LOGIN\",\"payload\":{\"passphrase\":\"hunter2\"}}");
         assertEquals("ERROR", intruder.next().path("type").asText());
+    }
+
+    // Proves the crash-recovery snapshot fires off the same onHandComplete hook the hands-
+    // played counter already uses - every seated player gets a table_state row matching their
+    // real stack once the hand resolves, not just the winner.
+    @Test
+    void handCompletionSnapshotsEverySeatedPlayersStackForCrashRecovery() throws Exception {
+        Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
+        app = new PokerServer(table).start(0);
+        String url = "ws://localhost:" + app.port() + "/ws";
+
+        TestClient a = new TestClient(url);
+        TestClient b = new TestClient(url);
+        JsonNode aWelcome = a.next();
+        b.next();
+        UUID aId = UUID.fromString(aWelcome.path("payload").path("playerId").asText());
+
+        a.send("{\"type\":\"SIT_DOWN\",\"payload\":{\"displayName\":\"A\",\"amount\":1000}}");
+        a.next();
+        b.next();
+        b.send("{\"type\":\"SIT_DOWN\",\"payload\":{\"displayName\":\"B\",\"amount\":1000}}");
+        a.next();
+        b.next();
+
+        a.send("{\"type\":\"NEXT_HAND\",\"payload\":{}}");
+        a.next();
+        b.next();
+        a.send("{\"type\":\"VOTE_GAME_MODE\",\"payload\":{\"mode\":\"TEXAS_HOLDEM\"}}");
+        a.next();
+        b.next();
+        b.send("{\"type\":\"VOTE_GAME_MODE\",\"payload\":{\"mode\":\"TEXAS_HOLDEM\"}}");
+        a.next(); // PREFLOP
+        b.next();
+
+        a.send("{\"type\":\"FOLD\",\"payload\":{}}"); // A folds uncontested - B wins the blinds
+        a.next(); // COMPLETE
+        b.next();
+        a.next();
+        b.next();
+
+        List<TableState.Row> rows = TableState.all();
+        assertEquals(2, rows.size());
+        TableState.Row aRow = rows.stream().filter(r -> r.playerUuid().equals(aId)).findFirst().orElseThrow();
+        assertEquals(995, aRow.stack()); // posted the 5 small blind, then folded
+        assertEquals(1000, aRow.totalBuyIn());
+    }
+
+    // A rebuy changes a seated player's stack on its own timing, not gated by the next hand
+    // finishing - the snapshot has to happen immediately, not just at onHandComplete.
+    @Test
+    void rebuySnapshotsImmediatelyNotJustAtNextHandComplete() throws Exception {
+        Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
+        app = new PokerServer(table).start(0);
+        String url = "ws://localhost:" + app.port() + "/ws";
+
+        TestClient a = new TestClient(url);
+        JsonNode aWelcome = a.next();
+        UUID aId = UUID.fromString(aWelcome.path("payload").path("playerId").asText());
+
+        a.send("{\"type\":\"SIT_DOWN\",\"payload\":{\"displayName\":\"A\",\"amount\":1000}}");
+        a.next();
+
+        // Force a bust directly through Table's own API (SITTING_OUT with an empty stack is
+        // the only state REBUY accepts) rather than playing out a whole hand just to lose one -
+        // that path is already covered by TableEngineTest.
+        Seat seat = table.seats()[0];
+        Player player = seat.player();
+        player.removeFromStack(player.stack());
+        player.setStatus(PlayerStatus.SITTING_OUT);
+
+        a.send("{\"type\":\"REBUY\",\"payload\":{\"amount\":500}}");
+        a.next();
+
+        List<TableState.Row> rows = TableState.all();
+        assertEquals(1, rows.size());
+        assertEquals(aId, rows.get(0).playerUuid());
+        assertEquals(500, rows.get(0).stack());
+        assertEquals(1500, rows.get(0).totalBuyIn()); // 1000 original buy-in + 500 rebuy
+    }
+
+    // Once a result is permanently recorded via LEAVE_TABLE, the scratch table_state copy has
+    // to go too - it's never a second ledger, only a live-session restore point.
+    @Test
+    void leavingASeatDeletesOnlyThatPlayersTableStateRow() throws Exception {
+        Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
+        app = new PokerServer(table).start(0);
+        String url = "ws://localhost:" + app.port() + "/ws";
+
+        TestClient a = new TestClient(url);
+        TestClient b = new TestClient(url);
+        JsonNode bWelcome;
+        a.next();
+        bWelcome = b.next();
+        UUID bId = UUID.fromString(bWelcome.path("payload").path("playerId").asText());
+
+        a.send("{\"type\":\"SIT_DOWN\",\"payload\":{\"displayName\":\"A\",\"amount\":1000}}");
+        a.next();
+        b.next();
+        b.send("{\"type\":\"SIT_DOWN\",\"payload\":{\"displayName\":\"B\",\"amount\":1000}}");
+        a.next();
+        b.next();
+
+        a.send("{\"type\":\"NEXT_HAND\",\"payload\":{}}");
+        a.next();
+        b.next();
+        a.send("{\"type\":\"VOTE_GAME_MODE\",\"payload\":{\"mode\":\"TEXAS_HOLDEM\"}}");
+        a.next();
+        b.next();
+        b.send("{\"type\":\"VOTE_GAME_MODE\",\"payload\":{\"mode\":\"TEXAS_HOLDEM\"}}");
+        a.next();
+        b.next();
+
+        a.send("{\"type\":\"FOLD\",\"payload\":{}}"); // between-hands now, both rows written
+        a.next();
+        b.next();
+        a.next();
+        b.next();
+        assertEquals(2, TableState.all().size());
+
+        a.send("{\"type\":\"LEAVE_TABLE\",\"payload\":{}}");
+        a.next();
+        b.next();
+
+        List<TableState.Row> rows = TableState.all();
+        assertEquals(1, rows.size());
+        assertEquals(bId, rows.get(0).playerUuid());
+    }
+
+    // END_TABLE is the protocol's explicit "the night is over" signal - it should wipe the
+    // whole live-session snapshot, not just clean up seat by seat as players individually leave.
+    @Test
+    void endTableClearsEveryTableStateRow() throws Exception {
+        Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
+        app = new PokerServer(table).start(0);
+        String url = "ws://localhost:" + app.port() + "/ws";
+
+        TestClient a = new TestClient(url);
+        TestClient b = new TestClient(url);
+        a.next();
+        b.next();
+
+        a.send("{\"type\":\"SIT_DOWN\",\"payload\":{\"displayName\":\"A\",\"amount\":1000}}");
+        a.next();
+        b.next();
+        b.send("{\"type\":\"SIT_DOWN\",\"payload\":{\"displayName\":\"B\",\"amount\":1000}}");
+        a.next();
+        b.next();
+
+        a.send("{\"type\":\"NEXT_HAND\",\"payload\":{}}");
+        a.next();
+        b.next();
+        a.send("{\"type\":\"VOTE_GAME_MODE\",\"payload\":{\"mode\":\"TEXAS_HOLDEM\"}}");
+        a.next();
+        b.next();
+        b.send("{\"type\":\"VOTE_GAME_MODE\",\"payload\":{\"mode\":\"TEXAS_HOLDEM\"}}");
+        a.next();
+        b.next();
+
+        a.send("{\"type\":\"FOLD\",\"payload\":{}}");
+        a.next();
+        b.next();
+        a.next();
+        b.next();
+        assertEquals(2, TableState.all().size());
+
+        a.send("{\"type\":\"END_TABLE\",\"payload\":{}}");
+        a.next();
+        b.next();
+
+        assertTrue(TableState.all().isEmpty());
+    }
+
+    // Drives PokerServer.rehydrateTableState directly against a freshly constructed Table -
+    // the crash-recovery path a real process restart would take, without actually restarting
+    // a process. Proves both halves: the saved stack/totalBuyIn split survives (so profit -
+    // and rebuy-vs-win - reconstructs correctly), and the display name comes along for a seat
+    // nobody's reconnected to yet.
+    @Test
+    void rehydrateTableStateReseatsPlayersAtTheirSavedStacksAndBuyIns() {
+        UUID playerId = UUID.randomUUID();
+        TableState.snapshot(playerId, "Alice", 750, 1000); // down 250 for the session so far
+
+        Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
+        PokerServer.rehydrateTableState(table);
+
+        Player restored = table.roster().stream()
+                .filter(p -> p.id().equals(playerId))
+                .findFirst()
+                .orElseThrow();
+        assertEquals("Alice", restored.displayName());
+        assertEquals(750, restored.stack());
+        assertEquals(1000, restored.totalBuyIn());
+        assertEquals(-250, restored.profit());
+    }
+
+    // The full loop, not just the two halves separately: a profile-backed player plays a hand
+    // (writing table_state), the process is treated as gone (a second, independent Table/
+    // PokerServer pair on a fresh port, standing in for a real restart against the same
+    // database), and logging back in with the same passphrase reclaims the exact seat
+    // rehydration restored - proving LOGIN's UUID-only matching (see persistence-design.html)
+    // actually connects to a rehydrated seat, not just that each half works in isolation.
+    @Test
+    void crashRecoveryEndToEndProfileBackedPlayerReclaimsTheirRehydratedSeatAfterARestart() throws Exception {
+        Table table1 = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
+        app = new PokerServer(table1).start(0);
+        String url1 = "ws://localhost:" + app.port() + "/ws";
+
+        TestClient a = new TestClient(url1);
+        TestClient b = new TestClient(url1);
+        a.next();
+        b.next();
+
+        a.send("{\"type\":\"CREATE_PROFILE\",\"payload\":{\"passphrase\":\"hunter2\",\"displayName\":\"Alice\"}}");
+        JsonNode created = a.next();
+        UUID profileUuid = UUID.fromString(created.path("payload").path("playerId").asText());
+
+        a.send("{\"type\":\"SIT_DOWN\",\"payload\":{\"displayName\":\"Alice\",\"amount\":1000}}");
+        a.next();
+        b.next();
+        b.send("{\"type\":\"SIT_DOWN\",\"payload\":{\"displayName\":\"B\",\"amount\":1000}}");
+        a.next();
+        b.next();
+
+        a.send("{\"type\":\"NEXT_HAND\",\"payload\":{}}");
+        a.next();
+        b.next();
+        a.send("{\"type\":\"VOTE_GAME_MODE\",\"payload\":{\"mode\":\"TEXAS_HOLDEM\"}}");
+        a.next();
+        b.next();
+        b.send("{\"type\":\"VOTE_GAME_MODE\",\"payload\":{\"mode\":\"TEXAS_HOLDEM\"}}");
+        a.next();
+        b.next();
+
+        // Heads-up, dealer/small blind (Alice, seat 0) acts first preflop - fold immediately,
+        // same turn-order rule every other test in this file relies on.
+        a.send("{\"type\":\"FOLD\",\"payload\":{}}"); // Alice folds, losing the 5-chip small blind
+        a.next();
+        b.next();
+        a.next();
+        b.next();
+
+        a.close();
+        b.close();
+        app.stop(); // stand-in for the process dying - table1 is now unreachable, same as a crash
+
+        Table table2 = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
+        PokerServer.rehydrateTableState(table2);
+        Javalin app2 = new PokerServer(table2).start(0);
+        try {
+            String url2 = "ws://localhost:" + app2.port() + "/ws";
+            TestClient reconnected = new TestClient(url2);
+            reconnected.next(); // WELCOME - a fresh guest UUID, about to be replaced
+
+            reconnected.send("{\"type\":\"LOGIN\",\"payload\":{\"passphrase\":\"hunter2\"}}");
+            JsonNode loggedIn = reconnected.next();
+            assertEquals(profileUuid.toString(), loggedIn.path("payload").path("playerId").asText());
+
+            // The seat rehydration placed before this connection ever existed is the same seat
+            // this login now controls - proven against Table directly, since LOGIN's WELCOME
+            // reply carries identity fields only, not a fresh table STATE broadcast (pre-
+            // existing behavior, unrelated to this feature).
+            Player restored = table2.roster().stream()
+                    .filter(p -> p.id().equals(profileUuid))
+                    .findFirst()
+                    .orElseThrow();
+            assertEquals(995, restored.stack()); // posted the 5 small blind, then folded
+            assertEquals(1000, restored.totalBuyIn());
+        } finally {
+            app2.stop();
+        }
+    }
+
+    // Checks a claim before acting on it: does a successful LOGIN ever reach the reconnecting
+    // client with a real table STATE, or only the identity-only WELCOME? onMessage wraps every
+    // dispatch() call - auth commands included - in one unconditional broadcastState() after a
+    // success, so this should already work without any new code.
+    @Test
+    void loginTriggersAStateBroadcastNotJustWelcome() throws Exception {
+        Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
+        app = new PokerServer(table).start(0);
+        String url = "ws://localhost:" + app.port() + "/ws";
+
+        TestClient a = new TestClient(url);
+        a.next(); // WELCOME - guest
+        a.send("{\"type\":\"CREATE_PROFILE\",\"payload\":{\"passphrase\":\"hunter2\",\"displayName\":\"Alice\"}}");
+        a.next(); // WELCOME - profile created
+        a.send("{\"type\":\"SIT_DOWN\",\"payload\":{\"displayName\":\"Alice\",\"amount\":1000}}");
+        a.next(); // STATE - seated
+        a.close();
+
+        TestClient reconnected = new TestClient(url);
+        reconnected.next(); // WELCOME - fresh guest identity, about to be replaced
+
+        reconnected.send("{\"type\":\"LOGIN\",\"payload\":{\"passphrase\":\"hunter2\"}}");
+        JsonNode first = reconnected.next();
+        assertEquals("WELCOME", first.path("type").asText());
+
+        JsonNode second = reconnected.next();
+        assertEquals("STATE", second.path("type").asText());
+        boolean seesOwnSeat = false;
+        for (JsonNode seat : second.path("payload").path("seats")) {
+            JsonNode player = seat.path("player");
+            if (!player.isNull() && !player.isMissingNode() && "Alice".equals(player.path("displayName").asText())) {
+                seesOwnSeat = true;
+            }
+        }
+        assertTrue(seesOwnSeat, "reconnecting client never received a STATE showing their restored seat");
     }
 
     // Stacks alone aren't stable across this call - if the hand chained into a new one,

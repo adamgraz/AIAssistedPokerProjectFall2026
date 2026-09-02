@@ -35,6 +35,14 @@ public final class Table {
     // pending-leaves cleanup) already funnels through, so persistence only needs one hook here
     // rather than one per caller.
     private BiConsumer<UUID, Player> onPlayerLeftSeat;
+    // Fires at the end of handleRebuy - a rebuy changes a seated player's stack on its own
+    // timing, not gated by the next hand finishing, so persistence snapshots it immediately
+    // instead of waiting for onHandComplete.
+    private BiConsumer<UUID, Player> onRebuy;
+    // Fires the moment `closed` actually becomes true - either immediately (handleEndTable,
+    // between hands) or deferred (finishHand, once a pending close resolves). Both paths route
+    // through markClosed() below so this only needs wiring in one place.
+    private Runnable onTableClosed;
 
     // Votes for which GameVariant the NEXT hand should use. Only accepted while votingOpen -
     // a player opens the window with NEXT_HAND once the previous hand has finished; the moment
@@ -116,6 +124,14 @@ public final class Table {
     // finishHand() chains into the next hand or nulls the round - the only point where that
     // stage is observable at all. Wire layer uses this to broadcast the showdown snapshot
     // that would otherwise never go out, since finishHand() runs synchronously inside apply().
+    public void setOnRebuy(BiConsumer<UUID, Player> listener) {
+        this.onRebuy = listener;
+    }
+
+    public void setOnTableClosed(Runnable listener) {
+        this.onTableClosed = listener;
+    }
+
     public void setOnHandComplete(Runnable listener) {
         this.onHandComplete = listener;
     }
@@ -227,14 +243,24 @@ public final class Table {
         }
         player.rebuy(request.amount());
         player.setStatus(PlayerStatus.ACTIVE);
+        if (onRebuy != null) {
+            onRebuy.accept(player.id(), player);
+        }
     }
 
     private void handleEndTable(TableCommandRequest request) {
         if (isBetweenHands()) {
-            closed = true;
-            currentRound = null;
+            markClosed();
         } else {
             pendingClose = true;
+        }
+    }
+
+    private void markClosed() {
+        closed = true;
+        currentRound = null;
+        if (onTableClosed != null) {
+            onTableClosed.run();
         }
     }
 
@@ -974,8 +1000,7 @@ public final class Table {
         pendingLeaves.clear();
 
         if (pendingClose) {
-            closed = true;
-            currentRound = null;
+            markClosed();
             return;
         }
 
