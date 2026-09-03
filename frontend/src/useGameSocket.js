@@ -7,10 +7,20 @@ import { useEffect, useRef, useState } from "react";
 // Java constant at build time - override with VITE_BACKEND_PORT in a .env.local file
 // (gitignored) if the backend is ever run on a different port.
 const BACKEND_PORT = import.meta.env.VITE_BACKEND_PORT ?? 7070;
-const WS_URL = `ws://${window.location.hostname}:${BACKEND_PORT}/ws`;
 const RECONNECT_DELAY_MS = 5000;
 const MAX_RECONNECT_ATTEMPTS = 5;
 const HEARTBEAT_INTERVAL_MS = 30000;
+const PLAYER_ID_STORAGE_KEY = "pokerPlayerId";
+
+// Whatever playerId the last WELCOME gave us, sent back on every connection attempt -
+// lets the server reclaim the same seat after a dropped socket (phone lock, app switch,
+// wifi blip) instead of handing back a fresh, unseated guest. Absent on the very first
+// visit; the server just mints a new one then, same as always.
+function wsUrl() {
+  const base = `ws://${window.location.hostname}:${BACKEND_PORT}/ws`;
+  const knownPlayerId = localStorage.getItem(PLAYER_ID_STORAGE_KEY);
+  return knownPlayerId ? `${base}?playerId=${encodeURIComponent(knownPlayerId)}` : base;
+}
 
 // One WebSocket connection for the whole app's lifetime. React's dev-mode double-mount
 // would otherwise open two sockets - the ref guards against that, not just cleanliness.
@@ -35,7 +45,7 @@ export function useGameSocket() {
     unmountedRef.current = false;
 
     function connect() {
-      const socket = new WebSocket(WS_URL);
+      const socket = new WebSocket(wsUrl());
       socketRef.current = socket;
 
       // StrictMode's dev-only double-mount opens a throwaway socket, then this same effect
@@ -84,6 +94,7 @@ export function useGameSocket() {
         console.log("[ws]", envelope.type, envelope.payload);
         switch (envelope.type) {
           case "WELCOME":
+            localStorage.setItem(PLAYER_ID_STORAGE_KEY, envelope.payload.playerId);
             setPlayerId(envelope.payload.playerId);
             setAvailableModes(envelope.payload.availableModes ?? []);
             setProfile(
@@ -126,5 +137,14 @@ export function useGameSocket() {
     socketRef.current.send(JSON.stringify({ type, payload }));
   }
 
-  return { connected, reconnectFailed, playerId, table, lastError, send, availableModes, profile };
+  // Drops the persisted identity and reloads, so the next connect gets a brand-new random
+  // guest UUID instead of reclaiming whatever's stored. Mainly for testing multiple seats
+  // from one browser (every tab/window shares the same localStorage, so they'd otherwise
+  // all reclaim the same player) - a real player wanting a fresh identity would use this too.
+  function forgetMe() {
+    localStorage.removeItem(PLAYER_ID_STORAGE_KEY);
+    window.location.reload();
+  }
+
+  return { connected, reconnectFailed, playerId, table, lastError, send, availableModes, profile, forgetMe };
 }

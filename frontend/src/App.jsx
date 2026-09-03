@@ -19,7 +19,8 @@ const LIVE_STAGES = ["PREFLOP", "FLOP", "TURN", "RIVER"];
 const BOMB_POT_OPT_IN_SECONDS = 60;
 
 function App() {
-  const { connected, reconnectFailed, playerId, table, lastError, send, availableModes, profile } = useGameSocket();
+  const { connected, reconnectFailed, playerId, table, lastError, send, availableModes, profile, forgetMe } =
+    useGameSocket();
   const [displayName, setDisplayName] = useState("Player");
   const [buyIn, setBuyIn] = useState(1000);
   const [betAmount, setBetAmount] = useState(20);
@@ -56,6 +57,18 @@ function App() {
   const canFold = canAct && owed > 0;
   const minRaiseTo = (round?.currentBet ?? 0) + (round?.lastRaiseSize ?? 0);
   const isBustedSittingOut = mySeat?.player.status === "SITTING_OUT" && mySeat?.player.stack === 0;
+
+  // votingOpen (below) is shared table state - the instant ANYONE clicks Next Hand, the server
+  // broadcasts it true for everyone. Without this, that one click would yank every other
+  // player's screen straight from the showdown into the vote panel. This local flag decouples
+  // "is voting technically open" (still tracked, still what actually gates the vote panel and
+  // hides the button once *this* player has engaged) from "has THIS player clicked yet" - each
+  // seat lingers on its own showdown view for as long as it wants. Reset the moment a genuinely
+  // new hand deals (isLiveBettingStage flips true), not on every unrelated broadcast.
+  const [iClickedNextHand, setIClickedNextHand] = useState(false);
+  useEffect(() => {
+    if (isLiveBettingStage) setIClickedNextHand(false);
+  }, [isLiveBettingStage]);
   const occupiedSeats = table?.seats.filter((s) => s.player !== null) ?? [];
   const notVoted = occupiedSeats.map((s) => s.player).filter((p) => !table?.votes?.[p.id]);
   const votingOpen = table?.votingOpen ?? false;
@@ -67,7 +80,7 @@ function App() {
   // No hand ever auto-starts, including the first - someone has to trigger it, same NEXT_HAND
   // flow as every later hand, so the whole table has a chance to sit down first.
   const canStartHand =
-    isSeated && occupiedSeats.length >= 2 && !votingOpen && !bombPotOptInOpen && (round === null || isComplete);
+    isSeated && occupiedSeats.length >= 2 && !iClickedNextHand && !bombPotOptInOpen && (round === null || isComplete);
 
   // Server doesn't send a deadline - this is a cosmetic countdown only, starting the moment
   // this client first sees the window open. The server's own 60s timeout is authoritative
@@ -106,13 +119,17 @@ function App() {
         <FinalStatsModal stats={finalStats} onContinue={() => setFinalStats(null)} />
       )}
       {isMyTurn && <div className="turn-banner-top">Your turn</div>}
-      {round && !votingOpen && !bombPotOptInOpen && (
+      {round && !iClickedNextHand && !bombPotOptInOpen && (
         <div className="round-banner-top">Round of {modeLabel(table.variant)}</div>
       )}
       <h1>Poker</h1>
       <p className="conn-status">
         {connected ? "connected" : reconnectFailed ? "connection lost — refresh to retry" : "reconnecting…"}
         {playerId && ` — ${playerId.slice(0, 8)}`}
+        {" "}
+        <button className="link-button" onClick={forgetMe} title="Forget this browser's saved identity and reconnect as a new guest">
+          not you?
+        </button>
       </p>
       {lastError && <p className="error">{lastError}</p>}
       {isSeated && (
@@ -154,11 +171,13 @@ function App() {
 
       {canStartHand && (
         <div className="controls">
-          <button onClick={() => send("NEXT_HAND")}>{round === null ? "Start hand" : "Next hand"}</button>
+          <button onClick={() => { send("NEXT_HAND"); setIClickedNextHand(true); }}>
+            {round === null ? "Start hand" : "Next hand"}
+          </button>
         </div>
       )}
 
-      {isSeated && votingOpen && (
+      {isSeated && votingOpen && iClickedNextHand && (
         <div className="mode-vote">
           <h2>Vote: next hand's mode</h2>
           <div className="mode-columns">

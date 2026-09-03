@@ -40,6 +40,14 @@ export function Seat({
   // Cleared server-side at the start of every street, so this only ever reflects the
   // CURRENT street's action - never a stale leftover from an earlier one.
   const lastAction = !isComplete && !hideLastHandCards ? round?.lastActionByPlayer?.[player.id] : undefined;
+  // The amount THIS player put in, not round.currentBet - currentBet is the street's running
+  // top, which is already wrong for anyone whose lastAction predates a later raise from
+  // someone else on the same street.
+  const lastActionAmount = round?.streetContributionByPlayer?.[player.id];
+  const lastActionLabel =
+    lastAction === "BET" ? `Bet: ${lastActionAmount}`
+    : lastAction === "RAISE" ? `Raise: ${lastActionAmount}`
+    : ACTION_LABELS[lastAction] ?? lastAction;
 
   return (
     <div className={`seat ${isActing ? "acting" : ""} ${isYou ? "you" : ""}`}>
@@ -57,7 +65,7 @@ export function Seat({
       </div>
       <div className="seat-stack">{player.stack} chips</div>
       <div className="seat-status">{player.status}</div>
-      {lastAction && <div className="seat-last-action">{ACTION_LABELS[lastAction] ?? lastAction}</div>}
+      {lastAction && <div className="seat-last-action">{lastActionLabel}</div>}
       {!isYou && !player.connected && canKick && (
         <button className="kick-button" onClick={() => onKick(player.id)}>Remove seat</button>
       )}

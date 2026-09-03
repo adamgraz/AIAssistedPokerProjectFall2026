@@ -691,6 +691,39 @@ class PokerServerIntegrationTest {
         assertTrue(seesOwnSeat, "reconnecting client never received a STATE showing their restored seat");
     }
 
+    // A guest never runs LOGIN - the frontend just replays the playerId its last WELCOME
+    // gave it as a "?playerId=" query param on the next connection. Same reclaim mechanism
+    // as LOGIN (Table only ever keys by playerId), but exercised on the plain connect path.
+    @Test
+    void guestReconnectingWithAKnownPlayerIdReclaimsTheirSeatAndSeesStateImmediately() throws Exception {
+        Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 0));
+        app = new PokerServer(table).start(0);
+        String url = "ws://localhost:" + app.port() + "/ws";
+
+        TestClient a = new TestClient(url);
+        JsonNode welcome = a.next(); // WELCOME - fresh guest identity
+        String guestId = welcome.path("payload").path("playerId").asText();
+        a.send("{\"type\":\"SIT_DOWN\",\"payload\":{\"displayName\":\"Bob\",\"amount\":1000}}");
+        a.next(); // STATE - seated
+        a.close();
+
+        TestClient reconnected = new TestClient(url + "?playerId=" + guestId);
+        JsonNode first = reconnected.next();
+        assertEquals("WELCOME", first.path("type").asText());
+        assertEquals(guestId, first.path("payload").path("playerId").asText());
+
+        JsonNode second = reconnected.next();
+        assertEquals("STATE", second.path("type").asText());
+        boolean seesOwnSeat = false;
+        for (JsonNode seat : second.path("payload").path("seats")) {
+            JsonNode player = seat.path("player");
+            if (!player.isNull() && !player.isMissingNode() && "Bob".equals(player.path("displayName").asText())) {
+                seesOwnSeat = true;
+            }
+        }
+        assertTrue(seesOwnSeat, "reconnecting guest never received a STATE showing their restored seat");
+    }
+
     // Stacks alone aren't stable across this call - if the hand chained into a new one,
     // blinds are already posted for it, so whatever's in the new round's pot has to be added
     // back to make an apples-to-apples total, same as TableEngineTest's chip-conservation check.

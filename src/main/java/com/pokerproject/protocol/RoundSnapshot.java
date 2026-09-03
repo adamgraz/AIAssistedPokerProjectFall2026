@@ -24,6 +24,10 @@ import java.util.UUID;
 // lastActionByPlayer: each player's most recent action on the CURRENT street only - cleared
 // the moment a new street starts, so a seat's "Raised"/"Called"/"Folded" tag never shows a
 // previous street's stale action.
+// streetContributionByPlayer: every seated player's contribution on the CURRENT street, not
+// just the viewer's own (see yourStreetContribution above) - lets a BET/RAISE tag show the
+// amount that player put in, which round.currentBet alone can't: currentBet is the street's
+// running top, so it's already wrong for anyone whose lastAction predates a later raise.
 // bestFiveByBoard: each showdown-eligible player's winning 5 cards on that board, for UI
 // highlighting - populated only at a real showdown (COMPLETE after resolveShowdown), empty
 // for an uncontested fold win where hands are never compared.
@@ -34,6 +38,7 @@ public record RoundSnapshot(RoundStage stage, List<List<Card>> boards, long pot,
                              List<Card> yourHoleCards, Map<UUID, List<Card>> revealedHoleCards,
                              long yourStreetContribution, long lastRaiseSize,
                              Map<UUID, ActionType> lastActionByPlayer,
+                             Map<UUID, Long> streetContributionByPlayer,
                              List<Map<UUID, List<Card>>> bestFiveByBoard,
                              List<Set<UUID>> winnersByBoard) {
 }

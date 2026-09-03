@@ -62,7 +62,8 @@ public final class SnapshotBuilder {
         return new RoundSnapshot(round.stage(), round.boards(), round.pot().total(),
                 round.smallBlindSeat(), round.bigBlindSeat(), round.actingSeat(), round.currentBet(),
                 yourHoleCards, revealed, round.contributionThisStreet(viewerId), round.lastRaiseSize(),
-                round.lastActionByPlayer(), round.bestFiveByBoard(), round.winnersByBoard());
+                round.lastActionByPlayer(), round.streetContributions(),
+                round.bestFiveByBoard(), round.winnersByBoard());
     }
 
     // A player's hand was actually compared - not just "didn't fold" - only when it shows up

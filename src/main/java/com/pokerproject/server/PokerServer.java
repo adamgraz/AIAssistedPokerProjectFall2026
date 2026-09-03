@@ -27,6 +27,7 @@ import io.javalin.websocket.WsConnectContext;
 import io.javalin.websocket.WsContext;
 import io.javalin.websocket.WsMessageContext;
 
+import java.time.Duration;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
@@ -139,22 +140,75 @@ public final class PokerServer {
     }
 
     public Javalin start(int port) {
-        Javalin app = Javalin.create(config -> config.routes.ws("/ws", ws -> {
-            ws.onConnect(this::onConnect);
-            ws.onMessage(this::onMessage);
-            ws.onClose(this::onClose);
-        }));
+        Javalin app = Javalin.create(config -> {
+            // Default idle timeout is short enough that a backgrounded tab (browsers
+            // throttle/delay its JS timers, including the client's 30s heartbeat) can get
+            // dropped within seconds of losing focus. 30 minutes covers a normal tab-switch
+            // or break without weakening the timeout's actual job: reaping connections that
+            // are truly gone. Even past this, the playerId-reclaim on reconnect still
+            // recovers the seat - this timeout only controls how long a *dead* connection
+            // lingers before the seat starts showing as disconnected.
+            config.jetty.modifyWebSocketServletFactory(wsFactory -> wsFactory.setIdleTimeout(Duration.ofMinutes(30)));
+            config.routes.ws("/ws", ws -> {
+                ws.onConnect(this::onConnect);
+                ws.onMessage(this::onMessage);
+                ws.onClose(this::onClose);
+            });
+        });
         return app.start(port);
     }
 
     // Guest by default, unchanged from before login existed: a fresh random UUID, zero
-    // friction, no backing Profile row. LOGIN/CREATE_PROFILE (below) aren't a gate in front of
-    // this - they're optional messages a client can send later to upgrade this connection's
-    // identity to a profile-backed one.
+    // friction, no backing Profile row - unless the client already has an identity from a
+    // previous connection (see reconnectPlayerId), in which case this reclaims it instead.
+    // LOGIN/CREATE_PROFILE (below) aren't a gate in front of this - they're optional messages
+    // a client can send later to upgrade this connection's identity to a profile-backed one.
     private void onConnect(WsConnectContext ctx) {
-        UUID playerId = UUID.randomUUID();
+        UUID playerId = reconnectPlayerId(ctx);
         connections.put(ctx, playerId);
-        sendWelcome(ctx, playerId, null);
+        sendWelcome(ctx, playerId, Profile.findByUuid(playerId).orElse(null));
+        // A reclaiming client's seat never changed server-side, but WELCOME alone carries no
+        // table data - without this, their screen would sit on "connected" showing nothing
+        // until some unrelated broadcast happened to fire later. Targeted at just this
+        // connection, not a full broadcast - a brand-new guest (the common case) still gets
+        // nothing beyond WELCOME, same as always, and nobody else's screen is disturbed by
+        // someone else merely reconnecting.
+        synchronized (table) {
+            boolean reclaimedASeat = table.roster().stream().anyMatch(p -> p.id().equals(playerId));
+            if (reclaimedASeat) {
+                sendStateTo(ctx, playerId);
+            }
+        }
+    }
+
+    private void sendStateTo(WsContext ctx, UUID playerId) {
+        Set<UUID> connectedIds = new HashSet<>(connections.values());
+        TableSnapshot snapshot = SnapshotBuilder.build(table, playerId, connectedIds);
+        ctx.send(new Envelope("STATE", MAPPER.valueToTree(snapshot)));
+    }
+
+    // Table keys everything (seats, acting player, votes) by playerId, never by connection -
+    // so a new socket that shows up already knowing its old playerId (the frontend persists
+    // it in localStorage) can just resume as that same player, seat and all, with nothing
+    // else anywhere needing to change. Covers a phone locking, an app switch, a wifi blip -
+    // anything short of the server itself restarting. A stale mapping for that id (the old
+    // socket hasn't onClose'd yet - phone put the app to sleep without a clean close) is
+    // evicted in favor of the newer connection rather than rejected, unlike LOGIN's "already
+    // logged in elsewhere" check - the newest tab winning is the expected outcome here, not
+    // an error.
+    private UUID reconnectPlayerId(WsConnectContext ctx) {
+        String requested = ctx.queryParam("playerId");
+        if (requested == null) {
+            return UUID.randomUUID();
+        }
+        UUID id;
+        try {
+            id = UUID.fromString(requested);
+        } catch (IllegalArgumentException e) {
+            return UUID.randomUUID();
+        }
+        connections.values().removeIf(existing -> existing.equals(id));
+        return id;
     }
 
     private void sendWelcome(WsContext ctx, UUID playerId, Profile profile) {
@@ -360,9 +414,9 @@ public final class PokerServer {
 
     public static void main(String[] args) {
         DB.initSchema();
-        // 9 seats, 5/10 blinds, 10-chip bomb pot ante - change a value, restart the instance
+        // 9 seats, 10/20 blinds, 50-chip bomb pot ante - change a value, restart the instance
         // (see GameConfig's own doc comment; no live reload, no CLI/env config by design).
-        Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(5, 10, 10));
+        Table table = new Table(9, GameVariant.TEXAS_HOLDEM, new GameConfig(10, 20, 50));
         rehydrateTableState(table);
         new PokerServer(table).start();
     }
